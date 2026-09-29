@@ -335,10 +335,11 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
-// limit = wie viele Treffer pro Suche geladen werden (Setting "Elemente pro Ansicht").
-// Modrinth erlaubt maximal 100, deshalb wird der Wert begrenzt.
-// TODO: aktuell nur ein simples Space -> %20 Escaping, kein volles URL-Encoding
-async fn search_projects(query: &str, project_type: &str, limit: i32, sort: &str) -> Option<Vec<ModrinthHit>> {
+// extra_facets = zusätzliche AND-Filter im Format "versions:1.21.1" oder "categories:fabric".
+// Leeres Slice = keine Zusatzfilter (so nutzt es der Modpack-Browser weiter wie bisher).
+// Modrinth verknüpft die äußeren Facet-Gruppen mit AND, deshalb bekommt jeder Filter
+// seine eigene Gruppe: [["project_type:mod"],["versions:1.21.1"],["categories:fabric"]]
+/*async fn search_projects(query: &str, project_type: &str, limit: i32, sort: &str) -> Option<Vec<ModrinthHit>> {
     let escaped_query = query.replace(' ', "%20");
     let facet = format!("%5B%5B%22project_type%3A{}%22%5D%5D", project_type);
     let limit = limit.clamp(1, 100);
@@ -357,6 +358,32 @@ async fn search_projects(query: &str, project_type: &str, limit: i32, sort: &str
         )
     };
     
+    let response: ModrinthSearchResponse = fetch(url, None).await.ok()?;
+    Some(response.hits)
+}*/
+async fn search_projects(query: &str, project_type: &str, limit: i32, sort: &str, extra_facets: &[String]) -> Option<Vec<ModrinthHit>> {
+    let escaped_query = query.replace(' ', "%20");
+    let limit = limit.clamp(1, 100);
+
+    // Erste Gruppe: der Projekttyp. %5B = [, %5D = ], %22 = ", %3A = :
+    let mut groups: Vec<String> = vec![format!("%5B%22project_type%3A{}%22%5D", project_type)];
+    for f in extra_facets {
+        groups.push(format!("%5B%22{}%22%5D", f.replace(':', "%3A")));
+    }
+    let facet = format!("%5B{}%5D", groups.join(","));
+
+    let url = if escaped_query.is_empty() {
+        format!(
+            "https://api.modrinth.com/v2/search?facets={}&limit={}&sort={}",
+            facet, limit, sort
+        )
+    } else {
+        format!(
+            "https://api.modrinth.com/v2/search?facets={}&limit={}&query={}&sort={}",
+            facet, limit, escaped_query, sort
+        )
+    };
+
     let response: ModrinthSearchResponse = fetch(url, None).await.ok()?;
     Some(response.hits)
 }
@@ -451,24 +478,31 @@ async fn fetch_project_info(project_id: &str) -> Option<ModrinthProjectInfo> {
 async fn search_cf_projects(query: &str, limit: i32, sort_by_downloads: bool) -> Option<Vec<CfSearchHit>> {
     let limit = limit.clamp(1, 100);
     
+    // classId=4471 = "Modpacks" bei CurseForge (Minecraft, gameId 432).
+    // Ohne diesen Filter kommen auch normale Mods, Resourcepacks, Welten etc. zurück.
+    // Als Konstante, damit wir den Wert nicht dreimal hart in die URLs schreiben müssen.
+    const CF_CLASS_MODPACKS: i32 = 4471;
+
     // URL bauen: searchFilter nur wenn Query nicht leer, sortField nur wenn Downloads gewünscht
     let url = if query.trim().is_empty() {
         // Leere Suche: Keine Filter, aber nach Downloads sortieren
         format!(
-            "https://api.curseforge.com/v1/mods/search?gameId=432&pageSize={}&sortField=2&sortOrder=desc",
-            limit
+            "https://api.curseforge.com/v1/mods/search?gameId=432&classId={}&pageSize={}&sortField=2&sortOrder=desc",
+            CF_CLASS_MODPACKS, limit
         )
     } else if sort_by_downloads {
         // Mit Suchbegriff + Downloads-Sortierung
         format!(
-            "https://api.curseforge.com/v1/mods/search?gameId=432&searchFilter={}&pageSize={}&sortField=2&sortOrder=desc",
+            "https://api.curseforge.com/v1/mods/search?gameId=432&classId={}&searchFilter={}&pageSize={}&sortField=2&sortOrder=desc",
+            CF_CLASS_MODPACKS,
             query.replace(' ', "%20"),
             limit
         )
     } else {
         // Mit Suchbegriff, Standard-Sortierung (Relevanz)
         format!(
-            "https://api.curseforge.com/v1/mods/search?gameId=432&searchFilter={}&pageSize={}",
+            "https://api.curseforge.com/v1/mods/search?gameId=432&classId={}&searchFilter={}&pageSize={}",
+            CF_CLASS_MODPACKS,
             query.replace(' ', "%20"),
             limit
         )
@@ -2070,7 +2104,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("🔍 Starte Suche nach: '{}' (Limit: {}, Sort: {})", query_str, limit, sort);
 
             let mr_future = async {
-                search_projects(&query_str, "modpack", limit, sort).await
+                // &[] = keine Zusatzfilter, Modpack-Suche bleibt wie bisher
+                search_projects(&query_str, "modpack", limit, sort, &[]).await
             };
             let cf_future = async {
                 let sort_by_downloads = is_empty;
@@ -2810,7 +2845,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // statt "modpack" und Ziel-Model ist add_mod_results statt browser_packs.
     // Cached ebenfalls das Icon pro Treffer, gleiches Prinzip wie on_browser_search.
     ui.on_detail_add_mod_search(move |query| {
-        let handle = add_mod_search_handle.clone();
+        /*let handle = add_mod_search_handle.clone();
         let ui_handle = add_mod_search_ui_handle.clone();
         let query = query.to_string();
 
@@ -2818,6 +2853,75 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         handle.spawn(async move {
             let Some(hits) = search_projects(&query, "mod", limit, "relevance").await else {
+                report_mod_progress(&ui_handle, "Suche fehlgeschlagen.".to_string());
+                return;
+            };
+
+            let launcherDir = dirs::data_local_dir()
+                .expect("kein Local Data Dir")
+                .join("srusm");
+            let icon_cache_dir = launcherDir.join("icon_cache");
+
+            let mut items_raw = Vec::new();
+            for hit in hits {
+                let icon_path = cache_icon(&icon_cache_dir, &hit.project_id, &hit.icon_url).await;
+                items_raw.push((hit, icon_path));
+            }
+
+            let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+                let items: Vec<BrowserPackInfo> = items_raw
+                    .into_iter()
+                    .map(|(hit, icon_path)| BrowserPackInfo {
+                        project_id: hit.project_id.into(),
+                        name: hit.title.into(),
+                        summary: hit.description.into(),
+                        author: hit.author.into(),
+                        icon: load_icon(&icon_path),
+                        source: "Modrinth".into(), // <-- NEU: Source hinzufügen
+                    })
+                    .collect();
+
+                ui.set_add_mod_results(ModelRc::new(VecModel::from(items)));
+            });
+        });*/
+
+        let handle = add_mod_search_handle.clone();
+        let ui_handle = add_mod_search_ui_handle.clone();
+        let query = query.to_string();
+
+        let ui = add_mod_search_ui_handle.unwrap();
+        let limit = ui.get_items_per_page();
+
+        // Welche Instanz ist gerade offen? Der Name steht schon in der UI-Property
+        // (wird in on_open_instance_details gesetzt), wir müssen also nichts in Slint ändern.
+        let instance_name = ui.get_detail_instance_name().to_string();
+
+        // instance.json synchron lesen (lokale Datei, geht schnell) und daraus die Filter bauen.
+        let mut extra_facets: Vec<String> = Vec::new();
+        let launcherDir = dirs::data_local_dir()
+            .expect("kein Local Data Dir")
+            .join("srusm");
+        let instance_json = launcherDir.join("instances").join(&instance_name).join("instance.json");
+
+        if let Ok(file) = File::open(&instance_json) {
+            if let Ok(config) = serde_json::from_reader::<_, ModpackJsonData>(BufReader::new(file)) {
+                // Minecraft-Version, z.B. "versions:1.21.1"
+                if !config.minecraft_version.is_empty() {
+                    extra_facets.push(format!("versions:{}", config.minecraft_version));
+                }
+
+                // Loader: bei CurseForge-Imports steht die volle ID drin (z.B. "forge-14.23.5.2860"),
+                // Modrinth kennt aber nur "forge". Deshalb alles ab dem ersten '-' abschneiden.
+                let loader = config.loader.split('-').next().unwrap_or("").to_lowercase();
+                if !loader.is_empty() && loader != "none" {
+                    extra_facets.push(format!("categories:{}", loader));
+                }
+            }
+
+        }
+
+        handle.spawn(async move {
+            let Some(hits) = search_projects(&query, "mod", limit, "relevance", &extra_facets).await else {
                 report_mod_progress(&ui_handle, "Suche fehlgeschlagen.".to_string());
                 return;
             };
