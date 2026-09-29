@@ -1,0 +1,1218 @@
+import { Button, VerticalBox, GridBox, LineEdit, HorizontalBox, ComboBox, CheckBox, Slider, ScrollView } from "std-widgets.slint";
+
+component ModpackTile inherits Rectangle {
+    
+    in property <string> name;
+    in property <image> icon;
+
+    min-width: 100px;
+    min-height: 170px;
+    //max-width: 100px;
+    max-height: 170px;
+
+    callback modpack_play(string);
+    callback modpack_details(string); // Klick irgendwo im Tile außer Play -> Detailansicht
+
+    // Liegt HINTER dem restlichen Inhalt, fängt also nur Klicks ab, die nicht
+    // vom Play-Button (der danach kommt und somit obenauf liegt) geschluckt werden.
+    TouchArea {
+        clicked => { root.modpack_details(root.name) }
+    }
+
+    VerticalLayout {
+        spacing: 8px;
+        padding: 10px;
+
+        HorizontalLayout {
+            alignment: center;
+            Image { source: root.icon; width: 40px; height: 40px; }
+        }
+        Text { text: name; height: 20px; horizontal-alignment: center; color: white; wrap: word-wrap; }
+        Button { text: "Play"; height: 40px; primary: true; clicked => {modpack_play(name)} }
+    }
+    
+    
+}
+
+struct BrowserPackInfo { project_id: string, name: string, summary: string, author: string, icon: image, source: string }
+struct CompatibilityActionUi { project_id: string, label: string, confirmed: bool }
+
+component BrowserTile inherits Rectangle {
+    in property <string> project_id;
+    in property <string> name;
+    in property <string> summary;
+    in property <string> author;
+    in property <image> icon;
+    in property <string> source;
+
+    callback install_clicked(string, string, string); // project_id, name, source
+
+    min-width: 220px;
+    min-height: 110px;
+    //max-width: 220px;
+    max-height: 110px;
+    background: #2c3747;
+    border-radius: 6px;
+
+    Rectangle {
+        x: parent.width - 72px;
+        y: 4px;
+        width: 68px;
+        height: 16px;
+        background: root.source == "CurseForge" ? #f16436 : #1bd96a; // Orange für CF, Grün für Modrinth
+        border-radius: 4px;
+        Text {
+            text: root.source;
+            font-size: 9px;
+            font-weight: 700;
+            color: white;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    VerticalLayout {
+        spacing: 6px;
+        padding: 12px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            Image { source: root.icon; width: 28px; height: 28px; }
+            Text { text: name; font-size: 16px; font-weight: 700; color: white; vertical-alignment: center; }
+        }
+        Text { text: summary; font-size: 11px; color: #a0a8b5; wrap: word-wrap; }
+        HorizontalLayout {
+            Text { text: "by " + author; font-size: 10px; color: #7a8291; }
+            Rectangle { horizontal-stretch: 1; }
+            Button { text: "Install"; height: 22px; clicked => { root.install_clicked(root.project_id, root.name, root.source) } } // Bei BrowserTile-Nutzung im Add-Mod-Popup zeigt der Button "Install", fügt dort aber direkt zur Instanz hinzu
+        }
+    }
+}
+
+struct ModpackInfo { name: string, minecraft_version: string, loader: string, ram_mb: int, icon: image }
+struct ModFileInfo { filename: string, display_name: string, enabled: bool, icon: image } // filename = tatsächlicher Dateiname auf Platte (ggf. mit ".disabled")
+struct AccountInfo { id: string, username: string, kind: string, selected: bool }
+
+export component AppWindow inherits Window {
+
+    // Callbacks
+    callback modpack_play(string);
+    callback create_and_run(string, string, string);
+    callback browser_search(string, string); // query, source
+    callback save_settings(int, string, string, bool, bool, bool, int, bool);
+    callback browser_open_install(string, string, string); // project_id, pack_name, source <-- GEÄNDERT
+    callback browser_confirm_install(int);
+    callback import_mrpack(string);
+    callback import_cf_zip(string); // <-- NEU: Für den .zip Import
+
+    callback compat_toggle_action(string);
+    callback compat_apply(string); // instance_name
+    callback compat_disable_conflicts(string); // instance_name
+    callback compat_cancel();
+
+    // Detail-Ansicht einer einzelnen Instanz
+    callback open_instance_details(string); // instance_name -> lädt Mods + Overrides, wechselt Panel
+    callback detail_toggle_mod(string, string); // instance_name, filename -> enable/disable
+    callback detail_remove_mod(string, string); // instance_name, filename
+    callback detail_save_overrides(string, bool, int, string, string); // instance_name, enabled, ram, java_path, username
+    callback detail_add_mod_search(string); // Suchtext im Add-Mod-Popup
+    callback detail_add_mod_install(string, string, string); // instance_name, project_id, project_name -> lädt passende Version direkt in mods/
+
+    // Account-Verwaltung
+    callback account_add_offline(string); // username
+    callback account_add_microsoft(); // aktuell nur Status-Meldung, siehe main.rs
+    callback account_select(string); // account id
+    callback account_remove(string); // account id
+    callback account_microsoft_open_browser();
+    callback account_microsoft_submit(string); // eingefügte Adresse bzw. Code
+
+    // Vars
+    in-out property <bool> popup_new_instance: false;
+    in-out property <string> selected_panel: "Instanzen";
+    in property <[ModpackInfo]> packs;
+    in property <[string]> mcVersions;
+    in property <[BrowserPackInfo]> browser_packs; // Ergebnisse der Modrinth-Suche
+
+    // Settings-Werte, werden beim Start aus settings.json befüllt (siehe main.rs)
+    in-out property <int> default_ram_mb: 2048;
+    in-out property <string> java_path: "";
+    in-out property <string> default_username: "TestUser";
+    in-out property <bool> close_after_launch: false;
+    in-out property <bool> open_on_startup: false;
+    in-out property <bool> show_snapshots: false;
+
+    // Install-Popup State (Version wählen für ein Pack aus dem Browser)
+    in-out property <bool> install_popup_visible: false;
+    in-out property <string> install_popup_pack_name: "";
+    in property <[string]> install_popup_versions; // Labels, z.B. "1.2.0 (1.21.1)"
+    in-out property <bool> install_popup_installing: false; // blockt Buttons während des Downloads
+    in-out property <string> install_popup_status: ""; // Fortschritts- oder Fehlertext
+    in-out property <bool> compat_popup_visible: false;
+    in property <[CompatibilityActionUi]> compat_actions;
+    in-out property <bool> compat_conflict_visible: false;
+    in property <[string]> compat_conflicts;
+    in-out property <bool> import_popup_visible: false;
+    in-out property <bool> import_busy: false;
+    
+    // <-- NEU: State für den CurseForge Import Dialog
+    in-out property <bool> import_cf_popup_visible: false;
+    in-out property <bool> import_cf_busy: false;
+
+    // Instanz-Detailansicht State
+    in-out property <string> detail_instance_name: "";
+    in-out property <image> detail_instance_icon;
+    in property <[ModFileInfo]> detail_mod_files;
+    in-out property <bool> detail_overrides_enabled: false;
+    in-out property <int> detail_ram_mb: 2048;
+    in-out property <string> detail_java_path: "";
+    in-out property <string> detail_username: "";
+
+    // Add-Mod-Popup State (innerhalb der Detailansicht)
+    in-out property <bool> add_mod_popup_visible: false;
+    in property <[BrowserPackInfo]> add_mod_results;
+    in-out property <string> add_mod_status: "";
+
+    // Account-Verwaltung State
+    in property <[AccountInfo]> accounts;
+    in-out property <string> accounts_status: "";
+    in-out property <bool> ms_popup_visible: false;
+    in property <string> ms_login_url: "";
+    in-out property <bool> ms_busy: false;
+    in-out property <string> ms_status: "";
+
+    // Anzeige-Einstellungen
+    in-out property <int> items_per_page: 12;
+    in-out property <bool> debug_ui: false;
+    in property <[string]> debug_log;
+
+    // NEU: Aktuelle Quelle im Browser (Standard ist Modrinth)
+    in-out property <string> browser_source: "Modrinth";
+
+    // Global Style
+    background: #313e50;
+    min-width: 800px;
+    min-height: 800px;
+    preferred-width: 1100px;  // Startgröße, gern anpassen
+    preferred-height: 800px;
+
+    GridLayout {
+        height: 100%;
+        width: 100%;
+
+        HorizontalLayout {
+            height: 100%;
+
+            Rectangle { // Sidebar-Hintergrund: eigene Rectangle, da Layouts selbst keine background-Property haben
+                width: 140px; // fest, sonst wird bei breitem Inhalt rechts mitgestreckt
+                height: 100%; // geht immer von ganz oben nach ganz unten, unabhängig vom Panel-Inhalt rechts
+                horizontal-stretch: 0; // nimmt sich keinen zusätzlichen Platz
+                background: #232c3a; // dunkler als der Fenster-Hintergrund, dezente Abstufung im gleichen Farbschema
+
+                VerticalLayout { // Selected Section
+                    height: 100%;
+                    spacing: 4px;
+                    padding: 8px;
+
+                    TouchArea {
+                        width: 100%;
+                        height: 50px; // etwas höher, damit zweizeiliger Text (z.B. "Modpack Browser") reinpasst
+                        clicked => { root.selected_panel = "Instanzen" }
+                        Text {
+                            text: "Instanzen";
+                            horizontal-alignment: center;
+                            font-size: 13px;
+                            font-weight: 900;
+                            wrap: word-wrap;
+                            color: (root.selected_panel == "Instanzen" || root.selected_panel == "Instance Detail") ? red : white;
+                        }
+                    }
+                    TouchArea {
+                        width: 100%;
+                        height: 50px;
+                        clicked => {
+                            root.selected_panel = "Modpack Browser";
+                            // Beim ersten Öffnen direkt mit leerem Query laden, damit nicht erst gesucht werden muss
+                            root.browser_search("", root.browser_source); // <-- GEÄNDERT
+                        }
+                        Text {
+                            text: "Modpack Browser";
+                            horizontal-alignment: center;
+                            font-size: 13px;
+                            font-weight: 900;
+                            wrap: word-wrap;
+                            color: root.selected_panel == "Modpack Browser" ? red : white;
+                        }
+                    }
+                    TouchArea {
+                        width: 100%;
+                        height: 50px;
+                        clicked => { root.selected_panel = "Accounts" }
+                        Text {
+                            text: "Accounts";
+                            horizontal-alignment: center;
+                            font-size: 13px;
+                            font-weight: 900;
+                            wrap: word-wrap;
+                            color: root.selected_panel == "Accounts" ? red : white;
+                        }
+                    }
+                    TouchArea {
+                        width: 100%;
+                        height: 50px;
+                        clicked => { root.selected_panel = "Settings" }
+                        Text {
+                            text: "Settings";
+                            horizontal-alignment: center;
+                            font-size: 13px;
+                            font-weight: 900;
+                            wrap: word-wrap;
+                            color: root.selected_panel == "Settings" ? red : white;
+                        }
+                    }
+
+                    Rectangle { vertical-stretch: 1; } // Rest-Platz nach unten, damit die Buttons oben bleiben statt sich zu verteilen
+                }
+            }
+            GridLayout { // Panel
+                height: 100%;
+                horizontal-stretch: 1; // nimmt sich den kompletten Rest-Platz neben der Sidebar
+
+                if selected_panel == "Instanzen" : VerticalLayout {
+                    HorizontalLayout { // Steuer Elemente
+                        max-height: 40px;
+                        spacing: 10px;
+                        alignment: start; // Buttons behalten ihre Breite
+
+                        Button {
+                            text: "New Instance";
+                            primary: true;
+                            width: 140px;
+                            clicked => {root.popup-new-instance = true}
+                        }
+                        Button {
+                            text: "Modpack importieren (.mrpack)";
+                            width: 240px;
+                            clicked => {
+                                root.install_popup_status = ""; // alten Status vom letzten Install/Import leeren
+                                root.import_popup_visible = true;
+                            }
+                        }
+                        Button {
+                            text: "CurseForge importieren (.zip)";
+                            width: 220px;
+                            clicked => {
+                                root.install_popup_status = "";
+                                root.import_cf_popup_visible = true;
+                            }
+                        }
+                    }
+
+                    instances_scroll := ScrollView {
+                        vertical-stretch: 1;
+                        property <int> cols: max(1, floor(((self.width / 1px) - 36) / 120));
+
+                        GridLayout {
+                            spacing: 20px;
+                            padding: 20px;
+
+                            for pack[i] in root.packs : ModpackTile {
+                                row: floor(i / instances_scroll.cols);
+                                col: mod(i, instances_scroll.cols);
+                                name: pack.name;
+                                icon: pack.icon;
+                                background: #333;
+                                modpack_play(n) => { root.modpack_play(n) }
+                                modpack_details(n) => { root.open_instance_details(n) }
+                            }
+                        }
+                    }
+
+                    //GridLayout { // Installierte Modpacks
+                    //    //Background Color change?                        
+                    //    spacing: 20px;
+                    //    padding: 20px;
+                    //
+                    //    for pack[i] in root.packs : ModpackTile {
+                    //        name: pack.name;
+                    //        icon: pack.icon;
+                    //        row: floor(i / 3);
+                    //        col: mod(i, 3);
+                    //        background: #333;
+                    //        modpack_play(n) => { root.modpack_play(n) }
+                    //        modpack_details(n) => { root.open_instance_details(n) }
+                    //    }
+                    //
+                    //}
+                }
+
+                if selected_panel == "Modpack Browser" : VerticalLayout {
+                    padding: 20px;
+                    spacing: 20px;
+
+                    HorizontalLayout { // Suchleiste
+                        max-height: 40px;
+                        spacing: 10px;
+
+                        browser_search_box := LineEdit {
+                            placeholder-text: "Modpacks durchsuchen...";
+                            accepted(text) => { root.browser_search(text, root.browser_source) } // <-- GEÄNDERT
+                        }
+                        Button {
+                            text: "Suchen";
+                            width: 80px;
+                            clicked => { root.browser_search(browser_search_box.text, root.browser_source) } // <-- GEÄNDERT
+                        }
+                    }
+
+                    browser_scroll := ScrollView {
+                        vertical-stretch: 1;
+                        property <int> cols: max(1, floor(((self.width / 1px) - 16) / 236)); // 220 Kachel + 16 Spacing
+
+                        GridLayout {
+                            spacing: 16px;
+
+                            for pack[i] in root.browser_packs : BrowserTile {
+                                row: floor(i / browser_scroll.cols);
+                                col: mod(i, browser_scroll.cols);
+                                project_id: pack.project_id;
+                                name: pack.name;
+                                summary: pack.summary;
+                                author: pack.author;
+                                icon: pack.icon;
+                                source: pack.source;
+                                install_clicked(id, n, src) => { root.browser_open_install(id, n, src) }
+                            }
+                        }
+                    }
+
+                    //GridLayout { // Ergebnis-Grid, kommt aus browser_packs (Modrinth)
+                    //    spacing: 16px;
+                    //
+                    //    for pack[i] in root.browser_packs : BrowserTile {
+                    //        row: floor(i / 3);
+                    //        col: mod(i, 3);
+                    //        project_id: pack.project_id;
+                    //        name: pack.name;
+                    //        summary: pack.summary;
+                    //        author: pack.author;
+                    //        icon: pack.icon;
+                    //        install_clicked(id, n) => { root.browser_open_install(id, n) }
+                    //    }
+                    //}
+
+                    //Rectangle { vertical-stretch: 1; } // Rest-Platz nach unten
+                }
+
+                if selected_panel == "Settings" : VerticalLayout {
+                    padding: 20px;
+                    spacing: 16px;
+                    alignment: start;
+
+                    Text { text: "Allgemein"; font-size: 18px; font-weight: 700; color: white; }
+
+                    HorizontalLayout {
+                        spacing: 10px;
+                        max-height: 30px;
+                        Text { text: "Standard-RAM (MB)"; color: white; vertical-alignment: center; width: 180px; }
+                        ram_slider := Slider {
+                            minimum: 1024;
+                            maximum: 16384;
+                            value: root.default_ram_mb;
+                        }
+                        Text { text: round(ram_slider.value) + " MB"; color: white; vertical-alignment: center; width: 80px; }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 10px;
+                        max-height: 30px;
+                        Text { text: "Java-Pfad"; color: white; vertical-alignment: center; width: 180px; }
+                        java_path_box := LineEdit {
+                            placeholder-text: "Automatisch erkannt";
+                            text: root.java_path;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 10px;
+                        max-height: 30px;
+                        Text { text: "Standard-Nutzername"; color: white; vertical-alignment: center; width: 180px; }
+                        username_box := LineEdit {
+                            placeholder-text: "TestUser";
+                            text: root.default_username;
+                        }
+                    }
+
+                    Rectangle { height: 10px; } // Trenner-Abstand
+
+                    HorizontalLayout {
+                        spacing: 10px;
+                        max-height: 30px;
+                        Text { text: "Elemente pro Ansicht"; color: white; vertical-alignment: center; width: 180px; }
+                        items_slider := Slider { minimum: 4; maximum: 48; value: root.items_per_page; }
+                        Text { text: round(items_slider.value); color: white; vertical-alignment: center; width: 40px; }
+                    }
+                    debug_ui_box := CheckBox { text: "Debug-UI anzeigen"; checked: root.debug_ui; }
+
+                    Text { text: "Launcher"; font-size: 18px; font-weight: 700; color: white; }
+
+                    close_after_launch_box := CheckBox { text: "Launcher nach Spielstart schließen"; checked: root.close_after_launch; }
+                    open_on_startup_box := CheckBox { text: "Beim Systemstart öffnen"; checked: root.open_on_startup; }
+                    show_snapshots_box := CheckBox { text: "Snapshot-Versionen anzeigen"; checked: root.show_snapshots; }
+
+                    Rectangle { vertical-stretch: 1; }
+
+                    Button {
+                        text: "Speichern";
+                        primary: true;
+                        width: 120px;
+                        clicked => {
+                            // Werte erst lokal in die properties übernehmen, dann Callback feuern
+                            root.default_ram_mb = round(ram_slider.value);
+                            root.java_path = java_path_box.text;
+                            root.default_username = username_box.text;
+                            root.close_after_launch = close_after_launch_box.checked;
+                            root.open_on_startup = open_on_startup_box.checked;
+                            root.show_snapshots = show_snapshots_box.checked;
+                            root.items_per_page = round(items_slider.value);
+                            root.debug_ui = debug_ui_box.checked;
+
+                            root.save_settings(
+                                root.default_ram_mb,
+                                root.java_path,
+                                root.default_username,
+                                root.close_after_launch,
+                                root.open_on_startup,
+                                root.show_snapshots,
+                                root.items_per_page,
+                                root.debug_ui,
+                            );
+                        }
+                    }
+                }
+
+                if selected_panel == "Accounts" : VerticalLayout {
+                    padding: 20px;
+                    spacing: 16px;
+                    alignment: start;
+
+                    Text { text: "Accounts"; font-size: 18px; font-weight: 700; color: white; }
+
+                    HorizontalLayout {
+                        max-height: 40px;
+                        spacing: 10px;
+
+                        account_username_box := LineEdit {
+                            placeholder-text: "Offline-Username...";
+                            accepted(text) => {
+                                root.account_add_offline(text);
+                                account_username_box.text = "";
+                            }
+                        }
+                        Button {
+                            text: "Offline-Account hinzufügen";
+                            width: 200px;
+                            clicked => {
+                                root.account_add_offline(account_username_box.text);
+                                account_username_box.text = "";
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        max-height: 30px;
+                        Button {
+                            text: "Microsoft-Account hinzufügen";
+                            width: 220px;
+                            clicked => { root.account_add_microsoft(); }
+                        }
+                    }
+
+                    if root.accounts_status != "" : Text {
+                        text: root.accounts_status;
+                        color: #a0d8a0;
+                        wrap: word-wrap;
+                        font-size: 12px;
+                    }
+
+                    Rectangle { height: 6px; } // Trenner-Abstand
+
+                    Text { text: "Gespeicherte Accounts"; font-size: 14px; font-weight: 700; color: white; }
+
+                    VerticalLayout {
+                        spacing: 6px;
+                        for acc in root.accounts : HorizontalLayout {
+                            max-height: 30px;
+                            spacing: 10px;
+
+                            Text {
+                                text: acc.username + " (" + acc.kind + ")" + (acc.selected ? "  – aktiv" : "");
+                                color: acc.selected ? red : white;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            Button {
+                                text: "Auswählen";
+                                width: 100px;
+                                height: 24px;
+                                enabled: !acc.selected;
+                                clicked => { root.account_select(acc.id); }
+                            }
+                            Button {
+                                text: "Entfernen";
+                                width: 90px;
+                                height: 24px;
+                                clicked => { root.account_remove(acc.id); }
+                            }
+                        }
+                    }
+
+                    Rectangle { vertical-stretch: 1; }
+                }
+
+                if selected_panel == "Instance Detail" : VerticalLayout {
+                    padding: 20px;
+                    spacing: 16px;
+
+                    HorizontalLayout {
+                        max-height: 30px;
+                        spacing: 10px;
+
+                        Button {
+                            text: "< Zurück";
+                            width: 90px;
+                            clicked => { root.selected_panel = "Instanzen" }
+                        }
+                        Image { source: root.detail_instance_icon; width: 28px; height: 28px; }
+                        Text {
+                            text: root.detail_instance_name;
+                            font-size: 20px;
+                            font-weight: 900;
+                            color: white;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text { text: "Mods"; font-size: 16px; font-weight: 700; color: white; }
+
+                    HorizontalLayout {
+                        max-height: 30px;
+                        Button {
+                            text: "+ Mod hinzufügen";
+                            width: 160px;
+                            clicked => {
+                                root.add_mod_popup_visible = true;
+                                root.add_mod_status = "";
+                                root.detail_add_mod_search("");
+                            }
+                        }
+                    }
+
+                    // Liste der Mods im mods-Ordner dieser Instanz, jetzt scrollbar.
+                    // vertical-stretch: 1 gibt der Liste den ganzen freien Platz zwischen Header und
+                    // Overrides-Bereich; bei vielen Mods scrollt sie, statt alles nach unten zu drücken.
+                    mods_scroll := ScrollView {
+                        vertical-stretch: 1;
+
+                        VerticalLayout {
+                            alignment: start; // Zeilen bleiben oben, auch wenn die Liste kurz ist
+                            spacing: 4px;
+
+                            for mod_file in root.detail_mod_files : HorizontalLayout {
+                                max-height: 26px;
+                                spacing: 10px;
+
+                                Image { source: mod_file.icon; width: 20px; height: 20px; }
+                                Text {
+                                    text: mod_file.display_name;
+                                    color: mod_file.enabled ? white : #7a8291; // deaktivierte Mods gedimmt
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    overflow: elide; // lange Dateinamen werden mit "..." gekürzt, die Buttons bleiben sichtbar
+                                }
+                                Button {
+                                    text: mod_file.enabled ? "Deaktivieren" : "Aktivieren";
+                                    width: 110px;
+                                    height: 24px;
+                                    clicked => { root.detail_toggle_mod(root.detail_instance_name, mod_file.filename) }
+                                }
+                                Button {
+                                    text: "Entfernen";
+                                    width: 90px;
+                                    height: 24px;
+                                    clicked => { root.detail_remove_mod(root.detail_instance_name, mod_file.filename) }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle { height: 10px; } // Trenner-Abstand
+
+                    Text { text: "Einstellungen für diese Instanz"; font-size: 16px; font-weight: 700; color: white; }
+
+                    detail_overrides_box := CheckBox {
+                        text: "Eigene Einstellungen für diese Instanz verwenden (statt globaler Settings)";
+                        checked: root.detail_overrides_enabled;
+                    }
+
+                    VerticalLayout {
+                        spacing: 10px;
+                        visible: detail_overrides_box.checked;
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            max-height: 30px;
+                            Text { text: "RAM (MB)"; color: white; vertical-alignment: center; width: 180px; }
+                            detail_ram_slider := Slider {
+                                minimum: 1024;
+                                maximum: 16384;
+                                value: root.detail_ram_mb;
+                            }
+                            Text { text: round(detail_ram_slider.value) + " MB"; color: white; vertical-alignment: center; width: 80px; }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            max-height: 30px;
+                            Text { text: "Java-Pfad"; color: white; vertical-alignment: center; width: 180px; }
+                            detail_java_path_box := LineEdit {
+                                placeholder-text: "Automatisch erkannt";
+                                text: root.detail_java_path;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            max-height: 30px;
+                            Text { text: "Nutzername"; color: white; vertical-alignment: center; width: 180px; }
+                            detail_username_box := LineEdit {
+                                placeholder-text: "TestUser";
+                                text: root.detail_username;
+                            }
+                        }
+                    }
+
+                    Rectangle { vertical-stretch: 1; }
+
+                    Button {
+                        text: "Overrides speichern";
+                        primary: true;
+                        width: 160px;
+                        clicked => {
+                            root.detail_overrides_enabled = detail_overrides_box.checked;
+                            root.detail_ram_mb = round(detail_ram_slider.value);
+                            root.detail_java_path = detail_java_path_box.text;
+                            root.detail_username = detail_username_box.text;
+
+                            root.detail_save_overrides(
+                                root.detail_instance_name,
+                                root.detail_overrides_enabled,
+                                root.detail_ram_mb,
+                                root.detail_java_path,
+                                root.detail_username,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if popup_new_instance : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #00000099;
+
+        TouchArea {
+            clicked => {popup_new_instance = false}
+        }
+
+        Rectangle {
+            width: 50%;
+            height: 50%;
+
+            x: parent.width/4;
+            y: parent.height/4;
+
+            background: #2c3747;
+
+            TouchArea {}
+
+            VerticalLayout {
+                spacing: 20px;
+                padding: 10px;
+
+                Text {
+                    text: "Instance Name";
+                    vertical-alignment: bottom;
+                    horizontal-alignment: center;
+                }
+                instance_name := LineEdit {
+                    placeholder-text: "Instance Name here...";
+                }
+                
+                Text {
+                    text: "Minecraft Version";
+                    vertical-alignment: bottom;
+                    horizontal-alignment: center;
+                }
+                instance_version := ComboBox {
+                    model: mcVersions;
+                }
+
+                Text {
+                    text: "Modloader";
+                    vertical-alignment: bottom;
+                    horizontal-alignment: center;
+                }
+                instance_modloader := ComboBox {
+                    model: ["Vanilla", "Fabric", "Forge", "neoforge"];
+                }
+
+                Button {
+                    text: "Create & Run";
+                    clicked => {create_and_run(instance_name.text, instance_version.current-value, instance_modloader.current-value)}
+                }
+
+            }
+        }
+    }
+
+    // Install-Popup: Version eines Modpacks aus dem Browser auswählen.
+    // Mehrfach-Installation ist möglich, da jede Bestätigung eine neue,
+    // eigene Instanz anlegt (Name enthält die gewählte Version) statt eine
+    // bestehende zu überschreiben. Zeigt während des Downloads Fortschritt
+    // (install_popup_status) und blockt die Buttons (install_popup_installing).
+    if install_popup_visible : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #00000099;
+
+        TouchArea {
+            clicked => {
+                if (!root.install_popup_installing) {
+                    root.install_popup_visible = false;
+                }
+            }
+        }
+
+        Rectangle {
+            width: 40%;
+            height: 34%;
+
+            x: parent.width/2 - self.width/2;
+            y: parent.height/2 - self.height/2;
+
+            background: #2c3747;
+
+            TouchArea {}
+
+            VerticalLayout {
+                spacing: 16px;
+                padding: 16px;
+
+                Text {
+                    text: "Version installieren: " + root.install_popup_pack_name;
+                    color: white;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                install_version_combo := ComboBox {
+                    model: root.install_popup_versions; // Labels wie "1.2.0 (1.21.1)"
+                    enabled: !root.install_popup_installing;
+                }
+
+                if root.install_popup_status != "" : Text {
+                    text: root.install_popup_status;
+                    color: #a0d8a0; // dezent grün, dient auch für Fehlermeldungen (kein extra Rot-Handling gewünscht -> einfach gehalten)
+                    wrap: word-wrap;
+                    horizontal-alignment: center;
+                    font-size: 12px;
+                }
+
+                HorizontalLayout {
+                    spacing: 10px;
+
+                    Button {
+                        text: "Abbrechen";
+                        enabled: !root.install_popup_installing;
+                        clicked => { root.install_popup_visible = false }
+                    }
+                    Button {
+                        text: root.install_popup_installing ? "Installiere..." : "Installieren";
+                        primary: true;
+                        enabled: !root.install_popup_installing;
+                        clicked => {
+                            root.install_popup_installing = true;
+                            root.install_popup_status = "Installation wird gestartet...";
+                            root.browser_confirm_install(install_version_combo.current-index);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Add-Mod-Popup: innerhalb der Instanz-Detailansicht, sucht Mods (nicht
+    // Modpacks) über Modrinth und installiert per Klick direkt in mods/.
+    if add_mod_popup_visible : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #00000099;
+
+        TouchArea {
+            clicked => { root.add_mod_popup_visible = false }
+        }
+
+        Rectangle {
+            width: 60%;
+            height: 60%;
+
+            x: parent.width/2 - self.width/2;
+            y: parent.height/2 - self.height/2;
+
+            background: #2c3747;
+
+            TouchArea {}
+
+            VerticalLayout {
+                spacing: 16px;
+                padding: 16px;
+
+                HorizontalLayout {
+                    max-height: 40px;
+                    spacing: 10px;
+
+                    add_mod_search_box := LineEdit {
+                        placeholder-text: "Mods durchsuchen...";
+                        accepted(text) => { root.detail_add_mod_search(text) }
+                    }
+                    Button {
+                        text: "Suchen";
+                        width: 80px;
+                        clicked => { root.detail_add_mod_search(add_mod_search_box.text) }
+                    }
+                    Button {
+                        text: "Schließen";
+                        width: 90px;
+                        clicked => { root.add_mod_popup_visible = false }
+                    }
+                }
+
+                if root.add_mod_status != "" : Text {
+                    text: root.add_mod_status;
+                    color: #a0d8a0;
+                    wrap: word-wrap;
+                    horizontal-alignment: center;
+                    font-size: 12px;
+                }
+
+                add_mod_scroll := ScrollView {
+                    vertical-stretch: 1;
+                    property <int> cols: max(1, floor((self.width / 1px) / 240));
+
+                    GridLayout {
+                        spacing: 16px;
+
+                        for pack[i] in root.add_mod_results : BrowserTile {
+                            row: floor(i / add_mod_scroll.cols);
+                            col: mod(i, add_mod_scroll.cols);
+                            project_id: pack.project_id;
+                            name: pack.name;
+                            summary: pack.summary;
+                            author: pack.author;
+                            icon: pack.icon;
+                            source: pack.source; // <-- NEU: Source auch hier übergeben
+                            install_clicked(id, n, src) => { root.detail_add_mod_install(root.detail_instance_name, id, n) } // src wird von Rust vorerst ignoriert
+                        }
+                    }
+                }
+
+                //GridLayout {
+                //    spacing: 16px;
+                //  
+                //    for pack[i] in root.add_mod_results : BrowserTile {
+                //        row: floor(i / 2);
+                //        col: mod(i, 2);
+                //        project_id: pack.project_id;
+                //        name: pack.name;
+                //        summary: pack.summary;
+                //        author: pack.author;
+                //        icon: pack.icon;
+                //        install_clicked(id, n) => { root.detail_add_mod_install(root.detail_instance_name, id, n) }
+                //    }
+                //}
+
+                //Rectangle { vertical-stretch: 1; }
+            }
+        }
+    }
+
+    if compat_popup_visible : Rectangle {
+        width: 100%; height: 100%;
+        background: #00000099;
+        TouchArea { clicked => { root.compat_cancel() } }
+
+        Rectangle {
+            width: 50%; height: 50%;
+            x: parent.width/2 - self.width/2;
+            y: parent.height/2 - self.height/2;
+            background: #2c3747;
+            TouchArea {}
+
+            VerticalLayout {
+                spacing: 12px;
+                padding: 16px;
+
+                if !root.compat_conflict_visible : Text {
+                    text: "Vorgeschlagene Änderungen";
+                    color: white; font-weight: 700; horizontal-alignment: center;
+                }
+                if !root.compat_conflict_visible : ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        spacing: 4px;
+                        for action in root.compat_actions : HorizontalLayout {
+                            max-height: 26px; spacing: 10px;
+                            Text { text: action.label; color: action.confirmed ? white : #7a8291; vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap; }
+                            Button {
+                                text: action.confirmed ? "Bestätigt" : "Übersprungen";
+                                width: 100px; height: 22px;
+                                clicked => { root.compat_toggle_action(action.project_id) }
+                            }
+                        }
+                    }
+                }
+                if !root.compat_conflict_visible : HorizontalLayout {
+                    spacing: 10px;
+                    Button { text: "Abbrechen"; clicked => { root.compat_cancel() } }
+                    Button { text: "Übernehmen"; primary: true; clicked => { root.compat_apply(root.detail_instance_name) } }
+                }
+
+                if root.compat_conflict_visible : Text {
+                    text: "Keine vollständig kompatible Kombination gefunden:";
+                    color: white; font-weight: 700; horizontal-alignment: center; wrap: word-wrap;
+                }
+                if root.compat_conflict_visible : ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        spacing: 4px;
+                        for line in root.compat_conflicts : Text { text: line; color: #e08a8a; wrap: word-wrap; font-size: 12px; }
+                    }
+                }
+                if root.compat_conflict_visible : HorizontalLayout {
+                    spacing: 10px;
+                    Button { text: "Abbrechen"; clicked => { root.compat_cancel() } }
+                    Button { text: "Betroffene Mods deaktivieren"; primary: true; clicked => { root.compat_disable_conflicts(root.detail_instance_name) } }
+                }
+            }
+        }
+    }
+
+    // Import-Popup: lokale .mrpack-Datei (Modrinth-Modpack) als neue Instanz importieren
+    if import_popup_visible : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #00000099;
+
+        TouchArea {
+            clicked => { if (!root.import_busy) { root.import_popup_visible = false; } }
+        }
+
+        Rectangle {
+            width: 60%;
+            height: 40%;
+            x: parent.width/2 - self.width/2;
+            y: parent.height/2 - self.height/2;
+            background: #2c3747;
+
+            TouchArea {}
+
+            VerticalLayout {
+                spacing: 12px;
+                padding: 16px;
+
+                Text { text: "Modpack importieren"; color: white; font-weight: 700; horizontal-alignment: center; }
+                Text {
+                    text: "Pfad zur .mrpack-Datei einfügen, z.B. ~/Downloads/MeinPack.mrpack. Tipp: Im Dateimanager Rechtsklick -> Pfad kopieren.";
+                    color: #a0a8b5;
+                    wrap: word-wrap;
+                    font-size: 12px;
+                }
+
+                import_path_box := LineEdit {
+                    placeholder-text: "/pfad/zur/datei.mrpack";
+                    enabled: !root.import_busy;
+                }
+
+                // Fortschritt und Fehler laufen über dieselbe Property wie beim Modpack-Install
+                if root.install_popup_status != "" : Text {
+                    text: root.install_popup_status;
+                    color: #a0d8a0;
+                    wrap: word-wrap;
+                    font-size: 12px;
+                }
+
+                Rectangle { vertical-stretch: 1; }
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    Button { text: "Abbrechen"; enabled: !root.import_busy; clicked => { root.import_popup_visible = false; } }
+                    Button {
+                        text: root.import_busy ? "Importiere..." : "Importieren";
+                        primary: true;
+                        enabled: !root.import_busy;
+                        clicked => {
+                            root.import_busy = true;
+                            root.install_popup_status = "Starte Import...";
+                            root.import_mrpack(import_path_box.text);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Microsoft-Login-Popup: Link öffnen, angemeldet Adresse der leeren Seite einfügen
+    if ms_popup_visible : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #00000099;
+
+        TouchArea {
+            clicked => { if (!root.ms_busy) { root.ms_popup_visible = false; } }
+        }
+
+        Rectangle {
+            width: 60%;
+            height: 55%;
+            x: parent.width/2 - self.width/2;
+            y: parent.height/2 - self.height/2;
+            background: #2c3747;
+
+            TouchArea {}
+
+            VerticalLayout {
+                spacing: 12px;
+                padding: 16px;
+
+                Text { text: "Microsoft-Login"; color: white; font-weight: 700; horizontal-alignment: center; }
+                Text {
+                    text: "1. Login-Seite im Browser öffnen und anmelden.\n2. Danach erscheint eine leere Seite. Kopiere die komplette Adresse aus der Adresszeile (enthält code=...).\n3. Adresse unten einfügen und auf Anmelden klicken.";
+                    color: #a0a8b5;
+                    wrap: word-wrap;
+                    font-size: 12px;
+                }
+
+                // Link zum manuellen Kopieren, falls sich der Browser nicht automatisch öffnet
+                LineEdit { text: root.ms_login_url; read-only: true; }
+                HorizontalLayout {
+                    Button { text: "Im Browser öffnen"; clicked => { root.account_microsoft_open_browser(); } }
+                }
+
+                ms_code_box := LineEdit {
+                    placeholder-text: "Adresse oder Code hier einfügen...";
+                    enabled: !root.ms_busy;
+                }
+
+                if root.ms_status != "" : Text {
+                    text: root.ms_status;
+                    color: #a0d8a0;
+                    wrap: word-wrap;
+                    font-size: 12px;
+                }
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    Button { text: "Abbrechen"; enabled: !root.ms_busy; clicked => { root.ms_popup_visible = false; } }
+                    Button {
+                        text: root.ms_busy ? "Melde an..." : "Anmelden";
+                        primary: true;
+                        enabled: !root.ms_busy;
+                        clicked => { root.account_microsoft_submit(ms_code_box.text); }
+                    }
+                }
+            }
+        }
+    }
+
+    if import_cf_popup_visible : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #00000099;
+
+        TouchArea {
+            clicked => { if (!root.import_cf_busy) { root.import_cf_popup_visible = false; } }
+        }
+
+        Rectangle {
+            width: 60%;
+            height: 40%;
+            x: parent.width/2 - self.width/2;
+            y: parent.height/2 - self.height/2;
+            background: #2c3747;
+            TouchArea {}
+
+            VerticalLayout {
+                spacing: 12px;
+                padding: 16px;
+
+                Text { text: "CurseForge Modpack importieren"; color: white; font-weight: 700; horizontal-alignment: center; }
+                Text {
+                    text: "Pfad zur heruntergeladenen CurseForge .zip-Datei einfügen. Das Modpack wird automatisch konvertiert und importiert.";
+                    color: #a0a8b5;
+                    wrap: word-wrap;
+                    font-size: 12px;
+                }
+
+                import_cf_path_box := LineEdit {
+                    placeholder-text: "/pfad/zum/curseforge_pack.zip";
+                    enabled: !root.import_cf_busy;
+                }
+
+                if root.install_popup_status != "" : Text {
+                    text: root.install_popup_status;
+                    color: #a0d8a0;
+                    wrap: word-wrap;
+                    font-size: 12px;
+                }
+
+                Rectangle { vertical-stretch: 1; }
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    Button { text: "Abbrechen"; enabled: !root.import_cf_busy; clicked => { root.import_cf_popup_visible = false; } }
+                    Button {
+                        text: root.import_cf_busy ? "Konvertiere & Importiere..." : "Importieren";
+                        primary: true;
+                        enabled: !root.import_cf_busy;
+                        clicked => {
+                            root.import_cf_busy = true;
+                            root.install_popup_status = "Starte Konvertierung und Import...";
+                            root.import_cf_zip(import_cf_path_box.text);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Debug-Panel: zeigt Log-Zeilen wenn debug_ui aktiv ist, liegt über allem anderen
+        if root.debug_ui : Rectangle {
+            y: parent.height - 150px;
+            width: 100%;
+            height: 150px;
+            background: #000000cc;
+
+            VerticalLayout {
+                padding: 8px;
+                Text { text: "Debug Log"; color: #a0d8a0; font-weight: 700; font-size: 12px; }
+                ScrollView {
+                    VerticalLayout {
+                        for line in root.debug_log : Text { text: line; color: #dddddd; font-size: 10px; }
+                    }
+                }
+            }
+        }
+    }
+}

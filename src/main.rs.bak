@@ -1,0 +1,1364 @@
+// Prevent console window in addition to Slint window in Windows release builds when, e.g., starting the app via file manager. Ignored on other platforms.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use std::{error::Error, fs, io::BufReader};
+use std::sync::{Arc, Mutex};
+use std::io::{Cursor, Read};
+use std::path::{Path, PathBuf};
+use lyceris::{http::fetch::fetch, install, json::version::manifest::{Type, VersionManifest}, launch, minecraft::{config::{ConfigBuilder, Profile}, loader::Loader}};
+use lyceris::minecraft::config::Memory;
+use slint::{Image, ModelRc, VecModel, Weak};
+use std::rc::Rc;
+use fs::File;
+use tokio::runtime::Builder;
+use slint::SharedString;
+use slint::Model;
+use std::collections::HashMap;
+use lyceris::minecraft::loader::{
+    fabric::Fabric, forge::Forge, neoforge::NeoForge, quilt::Quilt,
+};
+use serde::{Deserialize, Serialize};
+
+slint::include_modules!();
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ModpackJsonData {
+    name: String,
+    minecraft_version: String,
+    loader: String,
+    ram_mb: i32,
+    // Pfad zur gecachten Icon-Datei (icon_cache/<project_id>.<ext>), falls vorhanden.
+    // #[serde(default)] damit bestehende, ältere instance.json-Dateien ohne dieses
+    // Feld weiterhin problemlos eingelesen werden können.
+    #[serde(default)]
+    icon_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LoaderEntry {
+    version: String,
+    #[serde(default)]
+    stable: bool,
+}
+
+// Struct für die Settings, wird 1:1 als settings.json gespeichert/geladen
+// (gleiches Pattern wie ModpackJsonData für instance.json)
+#[derive(Debug, Serialize, Deserialize)]
+struct LauncherSettings {
+    default_ram_mb: i32,
+    java_path: String,
+    default_username: String,
+    close_after_launch: bool,
+    open_on_startup: bool,
+    show_snapshots: bool,
+}
+
+// Default-Werte falls noch keine settings.json existiert (erster Start)
+impl Default for LauncherSettings {
+    fn default() -> Self {
+        Self {
+            default_ram_mb: 2048,
+            java_path: String::new(),
+            default_username: "TestUser".to_string(),
+            close_after_launch: false,
+            open_on_startup: false,
+            show_snapshots: false,
+        }
+    }
+}
+
+// Instanz-eigene Overrides (RAM/Java/Username), optional aktivierbar, wird als
+// instance_overrides.json direkt im jeweiligen Instanz-Ordner abgelegt.
+// TODO: java_path wird gespeichert, aber noch nicht in den ConfigBuilder beim
+// Start eingespeist (das war schon bei den globalen Settings nicht verdrahtet).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InstanceOverrides {
+    enabled: bool,
+    ram_mb: i32,
+    java_path: String,
+    username: String,
+}
+
+impl Default for InstanceOverrides {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ram_mb: 2048,
+            java_path: String::new(),
+            username: "TestUser".to_string(),
+        }
+    }
+}
+
+// Response-Struct für die Modrinth Such-API (https://api.modrinth.com/v2/search)
+// nur die Felder die wir für die BrowserTile brauchen. Alles hier drin sind
+// plain Strings (Send), damit das problemlos über handle.spawn wandern kann.
+#[derive(Deserialize)]
+struct ModrinthHit {
+    project_id: String,
+    title: String,
+    description: String,
+    author: String,
+    icon_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ModrinthSearchResponse {
+    hits: Vec<ModrinthHit>,
+}
+
+// Response-Struct für die Modrinth Projekt-API (https://api.modrinth.com/v2/project/{id}),
+// wird genutzt um nachträglich (z.B. beim Installieren) an die icon_url zu kommen,
+// falls die nicht schon aus einem Suchtreffer bekannt ist.
+#[derive(Deserialize)]
+struct ModrinthProjectInfo {
+    icon_url: Option<String>,
+}
+
+// Eine einzelne Datei innerhalb einer Modrinth-Version (meistens die .mrpack
+// oder einzelne Mod-Jars, je nach Projekt). "primary" markiert die Hauptdatei.
+#[derive(Debug, Clone, Deserialize)]
+struct ModrinthFile {
+    url: String,
+    filename: String,
+    #[serde(default)]
+    primary: bool,
+}
+
+// Response-Struct für die Modrinth Versions-API
+// (https://api.modrinth.com/v2/project/{id}/version), inkl. der Felder die
+// wir für den echten Download brauchen (loaders, files).
+#[derive(Debug, Clone, Deserialize)]
+struct ModrinthVersionInfo {
+    version_number: String,
+    game_versions: Vec<String>,
+    loaders: Vec<String>,
+    files: Vec<ModrinthFile>,
+}
+
+// Hält die zuletzt geladenen Versionen für das aktuell offene Install-Popup,
+// damit on_browser_confirm_install (bekommt nur den gewählten Index von Slint)
+// weiß welches Pack/welche Version genau gemeint war. project_id wird
+// zusätzlich für den Icon-Download beim Bestätigen gebraucht.
+struct PendingInstall {
+    project_id: String,
+    pack_name: String,
+    versions: Vec<ModrinthVersionInfo>,
+}
+
+// Eine Datei-Referenz aus der modrinth.index.json innerhalb eines .mrpack.
+// "path" ist relativ zum Instanz-Ordner (meist "mods/xyz.jar").
+#[derive(Debug, Deserialize)]
+struct MrpackIndexFile {
+    path: String,
+    downloads: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MrpackIndex {
+    files: Vec<MrpackIndexFile>,
+}
+
+// Plain-Data-Variante der Mod-Zeilen für die Detailansicht (Send-sicher, ohne
+// slint::Image). Das eigentliche ModFileInfo (mit geladenem Icon) wird erst
+// auf dem UI-Thread daraus gebaut, siehe build_mod_file_info.
+struct ModFileEntry {
+    filename: String,
+    display_name: String,
+    enabled: bool,
+    icon_path: Option<String>,
+}
+
+// Sucht Projekte über die Modrinth API, project_type steuert ob Modpacks
+// ("modpack") oder einzelne Mods ("mod") gefunden werden. query kann leer
+// sein (dann kommen die aktuell populärsten Projekte des Typs zurück).
+// TODO: aktuell nur ein simples Space -> %20 Escaping, kein volles URL-Encoding
+// (keine neue Crate wie z.B. "urlencoding" reingezogen ohne vorher zu fragen).
+// Bei Sonderzeichen in der Suche kann das noch Probleme machen.
+async fn search_projects(query: &str, project_type: &str) -> Option<Vec<ModrinthHit>> {
+    let escaped_query = query.replace(' ', "%20");
+    let facet = format!("%5B%5B%22project_type%3A{}%22%5D%5D", project_type);
+    let url = format!(
+        "https://api.modrinth.com/v2/search?facets={}&limit=12&query={}",
+        facet, escaped_query
+    );
+
+    let response: ModrinthSearchResponse = fetch(url, None).await.ok()?;
+    Some(response.hits)
+}
+
+// Lädt alle verfügbaren Versionen eines Modrinth-Projekts (Modpack oder Mod).
+// Neueste zuerst laut Modrinth-API-Reihenfolge.
+async fn fetch_pack_versions(project_id: &str) -> Option<Vec<ModrinthVersionInfo>> {
+    let url = format!("https://api.modrinth.com/v2/project/{}/version", project_id);
+    fetch(url, None).await.ok()
+}
+
+// Fragt die icon_url eines Modrinth-Projekts ab (falls nicht schon aus einem
+// Suchtreffer bekannt, z.B. beim Bestätigen einer Installation).
+async fn fetch_project_icon_url(project_id: &str) -> Option<String> {
+    let url = format!("https://api.modrinth.com/v2/project/{}", project_id);
+    let project: ModrinthProjectInfo = fetch(url, None).await.ok()?;
+    project.icon_url
+}
+
+// Lädt eine URL als rohe Bytes herunter (für .mrpack-Archive und einzelne Mod-Dateien).
+async fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let response = reqwest::get(url)
+        .await
+        .map_err(|e| format!("Download fehlgeschlagen: {e}"))?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("Konnte Antwort nicht lesen: {e}"))?;
+    Ok(bytes.to_vec())
+}
+
+// Lädt ein Icon herunter und legt es im Icon-Cache-Ordner ab (Dateiname = key,
+// z.B. die Modrinth-Projekt-ID). Liegt die Datei schon im Cache, wird nicht
+// erneut heruntergeladen. Gibt den Pfad zurück (Send-sicher als PathBuf),
+// das eigentliche slint::Image wird erst auf dem UI-Thread daraus gebaut.
+async fn cache_icon(icon_cache_dir: &Path, key: &str, icon_url: &Option<String>) -> Option<PathBuf> {
+    let url = icon_url.as_ref()?;
+    // Dateiendung aus der URL übernehmen (z.B. png, webp), sonst Fallback "png"
+    let ext = url.rsplit('.').next().filter(|e| e.len() <= 4).unwrap_or("png");
+    let cache_path = icon_cache_dir.join(format!("{key}.{ext}"));
+
+    if !cache_path.is_file() {
+        let bytes = download_bytes(url).await.ok()?;
+        fs::create_dir_all(icon_cache_dir).ok()?;
+        fs::write(&cache_path, &bytes).ok()?;
+    }
+
+    Some(cache_path)
+}
+
+// Lädt ein Icon von Platte als slint::Image. Muss auf dem UI-Thread aufgerufen
+// werden (analog zu allen anderen Stellen, an denen wir erst nach dem
+// Thread-Wechsel Slint-Typen bauen). Fehlt der Pfad oder schlägt das Laden
+// fehl, kommt einfach ein leeres Bild zurück statt eines Absturzes.
+fn load_icon(path: &Option<PathBuf>) -> Image {
+    match path {
+        Some(p) => Image::load_from_path(p).unwrap_or_default(),
+        None => Image::default(),
+    }
+}
+
+// Schreibt eine kleine Statusmeldung ins Install-Popup, sicher vom Tokio-Thread
+// aus aufrufbar (Weak<AppWindow> ist Send, im Gegensatz zu Rc<VecModel<...>>).
+fn report_progress(ui_handle: &Weak<AppWindow>, text: String) {
+    let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+        ui.set_install_popup_status(text.into());
+    });
+}
+
+// Gleiches Prinzip wie report_progress, aber fürs Add-Mod-Popup in der Detailansicht.
+fn report_mod_progress(ui_handle: &Weak<AppWindow>, text: String) {
+    let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+        ui.set_add_mod_status(text.into());
+    });
+}
+
+// Entpackt ein .mrpack-Archiv (Zip) in den Instanz-Ordner:
+// - "overrides/" bzw. "client-overrides/" werden 1:1 in den Instanz-Ordner kopiert
+//   (Configs, Resourcepacks, Shader etc., die im Pack mitgeliefert werden)
+// - "modrinth.index.json" listet die eigentlichen Mod-Jars, die wir einzeln
+//   nachladen und unter ihrem "path" (meist "mods/xyz.jar") ablegen
+async fn install_mrpack(
+    instance_dir: &PathBuf,
+    mrpack_bytes: Vec<u8>,
+    ui_handle: &Weak<AppWindow>,
+) -> Result<(), String> {
+    let cursor = Cursor::new(mrpack_bytes);
+    let mut archive = zip::ZipArchive::new(cursor)
+        .map_err(|e| format!("Konnte .mrpack nicht als Zip öffnen: {e}"))?;
+
+    // 1. modrinth.index.json einlesen, dort steht drin welche Mods geladen werden müssen
+    let index: MrpackIndex = {
+        let mut index_file = archive
+            .by_name("modrinth.index.json")
+            .map_err(|e| format!("modrinth.index.json fehlt im .mrpack: {e}"))?;
+        let mut contents = String::new();
+        index_file
+            .read_to_string(&mut contents)
+            .map_err(|e| format!("Konnte modrinth.index.json nicht lesen: {e}"))?;
+        serde_json::from_str(&contents)
+            .map_err(|e| format!("Konnte modrinth.index.json nicht parsen: {e}"))?
+    };
+
+    // 2. overrides/ direkt aus dem Zip-Archiv in den Instanz-Ordner entpacken
+    report_progress(ui_handle, "Entpacke Overrides...".to_string());
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| format!("Zip-Fehler: {e}"))?;
+        let name = entry.name().to_string();
+
+        let Some(rel_path) = name
+            .strip_prefix("overrides/")
+            .or_else(|| name.strip_prefix("client-overrides/"))
+        else {
+            continue; // kein Override-Eintrag, ignorieren (z.B. modrinth.index.json selbst)
+        };
+
+        if rel_path.is_empty() {
+            continue; // der Ordner-Eintrag "overrides/" selbst
+        }
+
+        let out_path = instance_dir.join(rel_path);
+
+        if entry.is_dir() {
+            fs::create_dir_all(&out_path).map_err(|e| format!("Konnte Ordner nicht anlegen: {e}"))?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| format!("Konnte Ordner nicht anlegen: {e}"))?;
+            }
+            let mut out_file =
+                File::create(&out_path).map_err(|e| format!("Konnte Datei nicht anlegen: {e}"))?;
+            std::io::copy(&mut entry, &mut out_file)
+                .map_err(|e| format!("Konnte Datei nicht schreiben: {e}"))?;
+        }
+    }
+
+    // 3. Die in modrinth.index.json referenzierten Mod-Dateien einzeln nachladen
+    let total = index.files.len();
+    for (i, file) in index.files.iter().enumerate() {
+        let Some(url) = file.downloads.first() else {
+            continue; // keine Download-URL angegeben, überspringen
+        };
+
+        report_progress(
+            ui_handle,
+            format!("Lade Mod {}/{}: {}", i + 1, total, file.path),
+        );
+
+        let bytes = download_bytes(url).await?;
+        let out_path = instance_dir.join(&file.path);
+
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("Konnte Ordner nicht anlegen: {e}"))?;
+        }
+        fs::write(&out_path, &bytes)
+            .map_err(|e| format!("Konnte Datei nicht schreiben ({}): {e}", file.path))?;
+    }
+
+    Ok(())
+}
+
+// Fallback für Versionen OHNE .mrpack (z.B. einzelne Mod-Jars als "files"):
+// lädt jede Datei einzeln direkt in den "mods"-Unterordner der Instanz.
+async fn download_files_direct(
+    instance_dir: &PathBuf,
+    files: &[ModrinthFile],
+    ui_handle: &Weak<AppWindow>,
+) -> Result<(), String> {
+    let mods_dir = instance_dir.join("mods");
+    fs::create_dir_all(&mods_dir).map_err(|e| format!("Konnte mods-Ordner nicht anlegen: {e}"))?;
+
+    let total = files.len();
+    for (i, file) in files.iter().enumerate() {
+        report_progress(
+            ui_handle,
+            format!("Lade Datei {}/{}: {}", i + 1, total, file.filename),
+        );
+
+        let bytes = download_bytes(&file.url).await?;
+        fs::write(mods_dir.join(&file.filename), &bytes)
+            .map_err(|e| format!("Konnte Datei nicht schreiben ({}): {e}", file.filename))?;
+    }
+
+    Ok(())
+}
+
+// Sucht unter den Versionen eines Mod-Projekts die beste Übereinstimmung zur
+// Ziel-Minecraft-Version (und wenn bekannt zum Loader), sonst einfach die
+// neueste Version. Best-effort, kein hartes Ausschlusskriterium.
+fn pick_best_matching_version<'a>(
+    versions: &'a [ModrinthVersionInfo],
+    mc_version: &str,
+    loader_kind: &str,
+) -> Option<&'a ModrinthVersionInfo> {
+    versions
+        .iter()
+        .find(|v| {
+            v.game_versions.iter().any(|gv| gv == mc_version)
+                && (loader_kind == "none"
+                    || v.loaders.iter().any(|l| l.to_lowercase() == loader_kind))
+        })
+        .or_else(|| versions.iter().find(|v| v.game_versions.iter().any(|gv| gv == mc_version)))
+        .or_else(|| versions.first())
+}
+
+// Lädt für ein Mod-Projekt die am besten passende Version und legt deren
+// primäre Datei direkt in den mods-Ordner der Instanz. Kein .mrpack-Handling
+// hier, da einzelne Mods normalerweise keine .mrpack-Dateien sind.
+// Gibt bei Erfolg (Dateiname, Versionsnummer) zurück, damit der Aufrufer
+// danach noch das Icon dazu cachen und in mod_icons.json eintragen kann.
+async fn install_mod_into_instance(
+    instance_dir: &PathBuf,
+    project_id: &str,
+    mc_version: &str,
+    loader_kind: &str,
+    ui_handle: &Weak<AppWindow>,
+) -> Result<(String, String), String> {
+    report_mod_progress(ui_handle, "Suche passende Version...".to_string());
+
+    let versions = fetch_pack_versions(project_id)
+        .await
+        .ok_or_else(|| "Konnte Versionen nicht laden".to_string())?;
+
+    let version = pick_best_matching_version(&versions, mc_version, loader_kind)
+        .ok_or_else(|| "Keine Version gefunden".to_string())?;
+
+    let file = version
+        .files
+        .iter()
+        .find(|f| f.primary)
+        .or_else(|| version.files.first())
+        .ok_or_else(|| "Version hat keine Datei".to_string())?;
+
+    report_mod_progress(ui_handle, format!("Lade {}...", file.filename));
+
+    let bytes = download_bytes(&file.url).await?;
+
+    let mods_dir = instance_dir.join("mods");
+    fs::create_dir_all(&mods_dir).map_err(|e| format!("Konnte mods-Ordner nicht anlegen: {e}"))?;
+    fs::write(mods_dir.join(&file.filename), &bytes)
+        .map_err(|e| format!("Konnte Datei nicht schreiben: {e}"))?;
+
+    Ok((file.filename.clone(), version.version_number.clone()))
+}
+
+// Listet alle Dateien im mods-Ordner einer Instanz für die Detailansicht auf,
+// als reine (Send-sichere) Daten - ohne slint::Image, das wird erst über
+// build_mod_file_info auf dem UI-Thread ergänzt. Deaktivierte Mods liegen als
+// "xyz.jar.disabled" vor (Konvention vieler Launcher), display_name zeigt den
+// Namen ohne dieses Suffix.
+fn list_mod_files_raw(instance_dir: &Path) -> Vec<ModFileEntry> {
+    let mods_dir = instance_dir.join("mods");
+    let Ok(entries) = fs::read_dir(&mods_dir) else {
+        return Vec::new(); // noch kein mods-Ordner vorhanden -> leere Liste
+    };
+
+    let icons = load_mod_icons(instance_dir);
+
+    let mut result: Vec<ModFileEntry> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| {
+            let filename = entry.file_name().to_string_lossy().to_string();
+            let enabled = !filename.ends_with(".disabled");
+            let display_name = filename.strip_suffix(".disabled").unwrap_or(&filename).to_string();
+            let icon_path = icons.get(&display_name).cloned();
+
+            ModFileEntry { filename, display_name, enabled, icon_path }
+        })
+        .collect();
+
+    result.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+    result
+}
+
+// Baut aus einem ModFileEntry (reine Daten) das Slint-ModFileInfo inkl.
+// geladenem Icon. MUSS auf dem UI-Thread aufgerufen werden.
+fn build_mod_file_info(entry: ModFileEntry) -> ModFileInfo {
+    let icon_path = entry.icon_path.map(PathBuf::from);
+    ModFileInfo {
+        filename: entry.filename.into(),
+        display_name: entry.display_name.into(),
+        enabled: entry.enabled,
+        icon: load_icon(&icon_path),
+    }
+}
+
+// Aktiviert/deaktiviert einen Mod durch Umbenennen (".disabled"-Suffix an-/abhängen).
+fn toggle_mod_file(instance_dir: &Path, filename: &str) {
+    let mods_dir = instance_dir.join("mods");
+    let old_path = mods_dir.join(filename);
+
+    let new_path = if let Some(stripped) = filename.strip_suffix(".disabled") {
+        mods_dir.join(stripped) // aktivieren
+    } else {
+        mods_dir.join(format!("{filename}.disabled")) // deaktivieren
+    };
+
+    if let Err(e) = fs::rename(&old_path, &new_path) {
+        println!("Konnte Mod nicht umbenennen: {e}");
+    }
+}
+
+fn remove_mod_file(instance_dir: &Path, filename: &str) {
+    let path = instance_dir.join("mods").join(filename);
+    if let Err(e) = fs::remove_file(&path) {
+        println!("Konnte Mod nicht entfernen: {e}");
+    }
+}
+
+// mod_icons.json: Zuordnung Mod-Dateiname (ohne ".disabled") -> Pfad zur
+// gecachten Icon-Datei, liegt direkt im Instanz-Ordner.
+fn load_mod_icons(instance_dir: &Path) -> HashMap<String, String> {
+    let path = instance_dir.join("mod_icons.json");
+    let Ok(file) = File::open(&path) else {
+        return HashMap::new();
+    };
+    let reader = BufReader::new(file);
+    serde_json::from_reader(reader).unwrap_or_default()
+}
+
+fn save_mod_icons(instance_dir: &Path, icons: &HashMap<String, String>) {
+    if let Ok(json) = serde_json::to_string_pretty(icons) {
+        if let Err(e) = fs::write(instance_dir.join("mod_icons.json"), json) {
+            println!("Konnte mod_icons.json nicht speichern: {e}");
+        }
+    }
+}
+
+// Lädt die instance_overrides.json einer Instanz, oder Defaults falls noch keine existiert.
+fn load_instance_overrides(instance_dir: &Path) -> InstanceOverrides {
+    let path = instance_dir.join("instance_overrides.json");
+    let Ok(file) = File::open(&path) else {
+        return InstanceOverrides::default();
+    };
+    let reader = BufReader::new(file);
+    serde_json::from_reader(reader).unwrap_or_default()
+}
+
+fn save_instance_overrides(instance_dir: &Path, overrides: &InstanceOverrides) {
+    let json = serde_json::to_string_pretty(overrides).expect("Error Making Overrides json");
+    if let Err(e) = fs::write(instance_dir.join("instance_overrides.json"), json) {
+        println!("Konnte Overrides nicht speichern: {e}");
+    }
+}
+
+async fn latest_loader_version(kind: &str, mc: &str) -> Option<String> {
+    match kind {
+        "fabric" => {
+            let list: Vec<LoaderEntry> =
+                fetch("https://meta.fabricmc.net/v2/versions/loader".to_string(), None)
+                    .await.ok()?;
+            list.into_iter().find(|e| e.stable).map(|e| e.version)
+        }
+        "quilt" => {
+            let list: Vec<LoaderEntry> =
+                fetch("https://meta.quiltmc.org/v3/versions/loader".to_string(), None)
+                    .await.ok()?;
+            // Quilt liefert kein stable-Flag, deshalb Pre-Releases (mit "-") überspringen
+            list.into_iter().find(|e| !e.version.contains('-')).map(|e| e.version)
+        }
+        "forge" => {
+            #[derive(Deserialize)]
+            struct Promos { promos: HashMap<String, String> }
+            let p: Promos = fetch(
+                "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json"
+                    .to_string(),
+                None,
+            ).await.ok()?;
+            p.promos
+                .get(&format!("{mc}-recommended"))
+                .or_else(|| p.promos.get(&format!("{mc}-latest")))
+                .cloned()
+        }
+        "neoforge" => {
+            #[derive(Deserialize)]
+            struct Versions { versions: Vec<String> }
+            let v: Versions = fetch(
+                "https://maven.neoforged.net/api/maven/versions/releases/net/neoforged/neoforge"
+                    .to_string(),
+                None,
+            ).await.ok()?;
+            let prefix = neoforge_prefix(mc)?;
+            v.versions.into_iter()
+                .filter(|v| v.starts_with(&prefix) && !v.contains('-'))
+                .last()
+        }
+        _ => None,
+    }
+}
+
+// 1.21.1 -> "21.1.", 1.21 -> "21.0."
+// Ab Minecraft 26.x (neues Jahres-Schema ohne führendes "1.") wird der komplette
+// mc-String 1:1 als Prefix übernommen, siehe match-Zweige unten.
+fn neoforge_prefix(mc: &str) -> Option<String> {
+    let parts: Vec<&str> = mc.split('.').collect();
+
+    match parts.as_slice() {
+        // Altes Schema: "1.21" -> "21.0.", "1.21.1" -> "21.1."
+        ["1", minor] => Some(format!("{minor}.0.")),
+        ["1", minor, patch] => Some(format!("{minor}.{patch}.")),
+
+        // Neues Schema ab 2026: "26.1" -> "26.1.", "26.1.1" -> "26.1.1."
+        [_year, _drop] => Some(format!("{mc}.")),
+        [_year, _drop, _hotfix] => Some(format!("{mc}.")),
+
+        _ => None,
+    }
+}
+
+fn make_loader(kind: &str, version: String) -> Option<Box<dyn Loader>> {
+    Some(match kind {
+        "fabric" => Fabric(version).into(),
+        "quilt" => Quilt(version).into(),
+        "forge" => Forge(version).into(),
+        "neoforge" => NeoForge(version).into(),
+        _ => return None,
+    })
+}
+
+// Bestimmt aus Modrinths "loaders"-Feld (z.B. ["fabric"] oder ["forge","neoforge"])
+// welchen unserer bekannten Loader-Kinds wir nehmen. Erster Treffer gewinnt.
+// Findet Modrinth keinen bekannten Loader (z.B. reines Datapack/Resourcepack), "none".
+fn pick_loader_kind(modrinth_loaders: &[String]) -> String {
+    let known = ["fabric", "forge", "neoforge", "quilt"];
+    for loader in modrinth_loaders {
+        let lower = loader.to_lowercase();
+        if known.contains(&lower.as_str()) {
+            return lower;
+        }
+    }
+    "none".to_string()
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let rt = Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+
+    let handle = rt.handle().clone();
+
+    let ui = AppWindow::new()?;
+
+    let ui_handle = ui.as_weak();
+    let create_and_run_ui_handle = ui_handle.clone();
+    let modpack_play_ui_handle = ui_handle.clone();
+    let versions_ui_handle = ui_handle.clone();
+    let save_settings_ui_handle = ui_handle.clone();
+    let browser_search_ui_handle = ui_handle.clone();
+    let install_open_ui_handle = ui_handle.clone();
+    let install_confirm_ui_handle = ui_handle.clone();
+    let open_details_ui_handle = ui_handle.clone();
+    let toggle_mod_ui_handle = ui_handle.clone();
+    let remove_mod_ui_handle = ui_handle.clone();
+    let save_overrides_ui_handle = ui_handle.clone();
+    let add_mod_search_ui_handle = ui_handle.clone();
+    let add_mod_install_ui_handle = ui_handle.clone();
+
+    // Extra Clones von handle, weil on_modpack_play weiter unten das
+    // ursprüngliche "handle" per "move" komplett in seine Closure reinzieht.
+    // Ohne diese Clones wäre "handle" danach in den späteren Callbacks nicht mehr nutzbar.
+    let browser_search_handle = handle.clone();
+    let install_open_handle = handle.clone();
+    let install_confirm_handle = handle.clone();
+    let add_mod_search_handle = handle.clone();
+    let add_mod_install_handle = handle.clone();
+
+    // Speichert Pack-Name + geladene Versionen für das aktuell offene
+    // Install-Popup, damit on_browser_confirm_install (bekommt nur einen
+    // Index von Slint) weiß was genau gemeint ist.
+    let pending_install: Arc<Mutex<Option<PendingInstall>>> = Arc::new(Mutex::new(None));
+    let pending_install_open = pending_install.clone();
+    let pending_install_confirm = pending_install.clone();
+
+    // Program Local Dir Setup
+    let launcherDir = dirs::data_local_dir()
+        .expect("kein Local Data Dir")
+        .join("srusm");
+    fs::create_dir_all(&launcherDir);
+
+    // Setup Folder Structur
+    fs::create_dir_all(&launcherDir.join("shared"));
+    fs::create_dir_all(&launcherDir.join("shared/runtime"));
+    fs::create_dir_all(&launcherDir.join("instances"));
+    fs::create_dir_all(&launcherDir.join("icon_cache"));
+
+    // Testing ModpackTiles
+    let modpacktilemodel = Rc::new(VecModel::from(vec![
+        //ModpackInfo { name: "Pack A".into()},
+        //ModpackInfo { name: "Pack B".into()},
+    ]));
+    ui.set_packs(ModelRc::from(modpacktilemodel.clone()));
+    // model.push(ModpackInfo { name: "Pack B".into(), image: ??? });
+
+    // Modpack Browser startet mit leerem Model, wird über on_browser_search befüllt.
+    // Wichtig: Wir halten hier keine Rc<VecModel<...>> fest, die später in
+    // handle.spawn() reinwandern müsste (Rc ist nicht Send) – siehe on_browser_search.
+    ui.set_browser_packs(ModelRc::new(VecModel::from(Vec::<BrowserPackInfo>::new())));
+
+    // Detail-Ansicht + Add-Mod-Popup starten ebenfalls mit leeren Models.
+    ui.set_detail_mod_files(ModelRc::new(VecModel::from(Vec::<ModFileInfo>::new())));
+    ui.set_add_mod_results(ModelRc::new(VecModel::from(Vec::<BrowserPackInfo>::new())));
+
+    // Settings laden (falls schon vorhanden), sonst Defaults nehmen und direkt
+    // eine settings.json anlegen, damit's beim nächsten Start schon da ist.
+    let settings_path = launcherDir.join("settings.json");
+    let settings: LauncherSettings = if settings_path.is_file() {
+        let file = File::open(&settings_path).expect("Error during file Reading of settings.json");
+        let reader = BufReader::new(file);
+        serde_json::from_reader(reader).expect("Error during extracting data out of settings.json")
+    } else {
+        let defaults = LauncherSettings::default();
+        let json = serde_json::to_string_pretty(&defaults).expect("Error Making Settings json");
+        fs::write(&settings_path, json).expect("Error Writing Settings File");
+        defaults
+    };
+
+    // Geladene (oder default) Settings in die UI-Properties schreiben, damit
+    // der Settings-Tab beim Öffnen die richtigen Werte anzeigt.
+    ui.set_default_ram_mb(settings.default_ram_mb);
+    ui.set_java_path(settings.java_path.clone().into());
+    ui.set_default_username(settings.default_username.clone().into());
+    ui.set_close_after_launch(settings.close_after_launch);
+    ui.set_open_on_startup(settings.open_on_startup);
+    ui.set_show_snapshots(settings.show_snapshots);
+
+    handle.spawn(async move { // Get all avaliable Minecraft Versions
+        let manifest: VersionManifest = fetch("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json".to_string(), None).await.expect("WELP HEELLLP MANIFEST IS BROKEN????!!!");
+        let versions: Vec<String> = manifest
+            .versions
+            .into_iter()
+            .filter(|v| matches!(v.r#type, Type::Release))
+            .map(|v| v.id)
+            .collect();
+
+        let _ = versions_ui_handle.upgrade_in_event_loop(move |ui| {
+            let items: Vec<SharedString> =
+                versions.into_iter().map(SharedString::from).collect();
+            ui.set_mcVersions(ModelRc::new(VecModel::from(items)));
+        });
+    });
+
+    // Search for Installed Instances
+    for instance in fs::read_dir(&launcherDir.join("instances"))? {
+        //if fs::exists(&launcherDir.join("instances/").join(instance).join("instance.json")) {
+        //    modpacktilemodel.push(ModpackInfo { name: "Test...".into() });
+        //}
+
+        let Ok(instance) = instance else {
+            continue;
+        };
+
+        let path = instance.path();
+
+        if !path.is_dir() {
+            continue;
+        }
+
+        if !path.join("instance.json").is_file() {
+            continue;
+        }
+
+        let Some(modpackname) = path.file_name() else {
+            continue; // Pfad ohne Namen überspringen
+        };
+
+        let file = File::open(&launcherDir.join("instances/").join(&modpackname).join("instance.json")).expect("Error during file Reading of instance.json");
+        let reader = BufReader::new(file);
+        
+        let config: ModpackJsonData = serde_json::from_reader(reader).expect("Error during extracting data out of instance.json");
+
+        // Icon-Pfad (falls vorhanden) klonen bevor die restlichen Felder unten
+        // per .into() verschoben werden, und direkt zu einem slint::Image laden.
+        let icon_path = config.icon_path.clone().map(PathBuf::from);
+
+        modpacktilemodel.push(ModpackInfo {
+            //name: modpackname.to_string_lossy().to_string().into(),
+            name: config.name.into(),
+            minecraft_version: config.minecraft_version.into(),
+            loader: config.loader.into(),
+            ram_mb: config.ram_mb,
+            icon: load_icon(&icon_path),
+        });
+        
+    }
+
+    ui.on_create_and_run(move |name, version, modloader| {
+        let ui = create_and_run_ui_handle.unwrap();
+        //let handle = handle.clone();
+        //let ui_handle = ui_handle.clone();
+
+        //if modloader == "NeoForge" {modloader = "neoforge".into()}
+
+        let data = ModpackJsonData {
+            name: name.to_string(),
+            minecraft_version: version.to_string(),
+            loader: modloader.to_string().to_lowercase(),
+            ram_mb: 2048,
+            icon_path: None, // manuell angelegte Instanz hat keine Modrinth-Herkunft, also kein Icon
+        };
+
+        let launcherDir = dirs::data_local_dir()
+            .expect("kein Local Data Dir")
+            .join("srusm");
+
+        let dir = &launcherDir.join("instances/").join(&data.name);
+        fs::create_dir_all(dir);
+
+        let json = serde_json::to_string_pretty(&data).expect("Errer Making json");
+        fs::write(dir.join("instance.json"), json).expect("Error Writing File");
+
+        ui.set_popup_new_instance(false);
+
+        ui.invoke_modpack_play(data.name.clone().into());
+
+        modpacktilemodel.push(ModpackInfo {
+            name: data.name.into(),
+            loader: data.loader.into(),
+            minecraft_version: data.minecraft_version.into(),
+            ram_mb: data.ram_mb,
+            icon: Image::default(),
+        });
+    });
+
+    // Play Instance
+    ui.on_modpack_play(move |name| {
+        let _ui = modpack_play_ui_handle.unwrap();
+        let handle = handle.clone();
+        let ui_handle = ui_handle.clone();
+
+        let launcherDir = dirs::data_local_dir()
+            .expect("kein Local Data Dir")
+            .join("srusm");
+
+        println!("Modpack Name: {}", name);
+
+        println!("{:?}", &launcherDir.join("instances/").join(&name).join("instance.json"));
+        
+        let instance_dir = launcherDir.join("instances/").join(&name);
+
+        let file = File::open(instance_dir.join("instance.json")).expect("Error during file Reading of instance.json");
+        let reader = BufReader::new(file);
+        
+        let config: ModpackJsonData = serde_json::from_reader(reader).expect("Error during extracting data out of instance.json");
+
+        println!("Modpack Name: {}\nMinecraft Version: {}\nModLoader: {}\n Ram MB: {}mb", name, config.minecraft_version, config.loader, config.ram_mb);
+
+        // Instanz-eigene Overrides laden: wenn aktiviert, überschreiben RAM und
+        // Username die Werte aus der instance.json bzw. den hart codierten
+        // "TestUser"-Default weiter unten.
+        let overrides = load_instance_overrides(&instance_dir);
+        let effective_ram_mb = if overrides.enabled { overrides.ram_mb } else { config.ram_mb };
+        let effective_username = if overrides.enabled { overrides.username.clone() } else { "TestUser".to_string() };
+
+        let _launcher_dir = launcherDir.clone();
+        let ui_handle = ui_handle.clone();
+        let handle = handle.clone();
+        let name = name.to_string();
+
+        handle.spawn(async move {
+            println!("Starte {}", name);
+
+            let builder = ConfigBuilder::new(
+                &launcherDir.join("shared"),
+                config.minecraft_version.clone(),
+                lyceris::AuthMethod::Offline { username: effective_username, uuid: None },
+            ).runtime_dir(launcherDir.join("shared/runtime"))
+            .memory(Memory::Megabyte(effective_ram_mb as u64))
+            .profile(Profile::new(name.to_string(), launcherDir.clone().join("instances")));
+            
+            if config.loader == "none" {
+                let cfg = builder.build();
+
+                if let Err(e) = install(&cfg, None).await {
+                    println!("Install-Fehler: {:?}", e);
+                    return;
+                }
+                if let Err(e) = launch(&cfg, None).await {
+                    println!("Start-Fehler: {:?}", e);
+                    return;
+                }
+            } else {
+                let Some(version) =
+                    latest_loader_version(&config.loader, &config.minecraft_version).await
+                else {
+                    println!("Loader-Version nicht gefunden");
+                    return;
+                };
+                let Some(loader) = make_loader(&config.loader, version) else {
+                    println!("Unbekannter Loader: {}", config.loader);
+                    return;
+                };
+
+                let cfg = builder.loader(loader).build();
+
+                if let Err(e) = install(&cfg, None).await {
+                    println!("Install-Fehler: {:?}", e);
+                    return;
+                }
+                if let Err(e) = launch(&cfg, None).await {
+                    println!("Start-Fehler: {:?}", e);
+                    return;
+                }
+            }
+
+            let _ = ui_handle.upgrade_in_event_loop(|_ui| {
+                println!("Minecraft gestartet");
+            });
+        });
+
+        /*let builded_config = minecraft_config.build();
+        let result = if config.loader == "none" {
+            builded_config = minecraft_config.build();
+        } else {
+            match latest_loader_version(&config.loader, &config.minecraft_version).await
+                .and_then(|v| make_loader(&config.loader, v))
+            {
+                Some(loader) => builded_config.loader(loader).build(),//run(builded_config.loader(loader).build()).await,
+                None => Err("Loader-Version nicht gefunden".to_string()),
+            }
+        };
+
+        //let builded_config = minecraft_config.build();
+
+        handle.spawn(async move {
+            // Testphase: später ersetzt du das durch JSON lesen, Config bauen, install() ...
+            println!("Starte {}", name);
+            //tokio::time::sleep(Duration::from_secs(3)).await;
+
+            install(&builded_config, None).await;
+            launch(&builded_config, None).await;
+
+            let _ = ui_handle.upgrade_in_event_loop(|ui| {
+                println!("Minecraft Gestarted");
+            });
+        });*/
+
+    });
+
+    // Settings speichern: baut aus den vom Slint-Button mitgegebenen Werten
+    // eine LauncherSettings-Struct und schreibt sie nach settings.json
+    // (exakt gleiches Schreib-Pattern wie bei instance.json oben).
+    ui.on_save_settings(move |ram, java_path, username, close_after_launch, open_on_startup, show_snapshots| {
+        let _ui = save_settings_ui_handle.unwrap();
+
+        let settings = LauncherSettings {
+            default_ram_mb: ram,
+            java_path: java_path.to_string(),
+            default_username: username.to_string(),
+            close_after_launch,
+            open_on_startup,
+            show_snapshots,
+        };
+
+        let launcherDir = dirs::data_local_dir()
+            .expect("kein Local Data Dir")
+            .join("srusm");
+
+        let json = serde_json::to_string_pretty(&settings).expect("Error Making Settings json");
+        fs::write(launcherDir.join("settings.json"), json).expect("Error Writing Settings File");
+
+        println!("Settings gespeichert: {:?}", settings);
+    });
+
+    // Modpack Browser Suche: fragt Modrinth async ab (auf dem Tokio-Thread,
+    // nur Send-Daten wie ModrinthHit/String sind hier unterwegs), cached dabei
+    // pro Treffer das Icon (siehe cache_icon) und baut das browser_packs
+    // Model erst INNERHALB von upgrade_in_event_loop neu auf, weil sowohl
+    // Rc<VecModel<...>> als auch slint::Image nicht garantiert Send sind und
+    // den Thread-Wechsel nicht mitmachen können. Gleiches Prinzip wie beim
+    // mcVersions-Model oben. Nutzt "browser_search_handle" statt "handle",
+    // weil "handle" bereits oben in on_modpack_play per "move" verschoben wurde.
+    ui.on_browser_search(move |query| {
+        let handle = browser_search_handle.clone();
+        let ui_handle = browser_search_ui_handle.clone();
+        let query = query.to_string();
+
+        handle.spawn(async move {
+            let Some(hits) = search_projects(&query, "modpack").await else {
+                println!("Modrinth-Suche fehlgeschlagen");
+                return;
+            };
+
+            let launcherDir = dirs::data_local_dir()
+                .expect("kein Local Data Dir")
+                .join("srusm");
+            let icon_cache_dir = launcherDir.join("icon_cache");
+
+            // Icons für alle Treffer laden/cachen (sequentiell, reicht für ~12 Ergebnisse)
+            let mut items_raw = Vec::new();
+            for hit in hits {
+                let icon_path = cache_icon(&icon_cache_dir, &hit.project_id, &hit.icon_url).await;
+                items_raw.push((hit, icon_path));
+            }
+
+            let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+                let items: Vec<BrowserPackInfo> = items_raw
+                    .into_iter()
+                    .map(|(hit, icon_path)| BrowserPackInfo {
+                        project_id: hit.project_id.into(),
+                        name: hit.title.into(),
+                        summary: hit.description.into(),
+                        author: hit.author.into(),
+                        icon: load_icon(&icon_path),
+                    })
+                    .collect();
+
+                ui.set_browser_packs(ModelRc::new(VecModel::from(items)));
+            });
+        });
+    });
+
+    // Install-Popup öffnen: lädt alle Versionen des gewählten Modrinth-Projekts
+    // und baut daraus die Labels fürs ComboBox-Model, z.B. "1.2.0 (1.21.1, 1.21.2)".
+    // Rohdaten (inkl. files/loaders + project_id) werden in pending_install
+    // gemerkt, damit on_browser_confirm_install später per Index das Richtige
+    // findet, tatsächlich herunterladen und das Icon dazu cachen kann.
+    ui.on_browser_open_install(move |project_id, pack_name| {
+        let ui = install_open_ui_handle.unwrap();
+        ui.set_install_popup_pack_name(pack_name.clone());
+        ui.set_install_popup_visible(true);
+        ui.set_install_popup_installing(false);
+        ui.set_install_popup_status(SharedString::from(""));
+        ui.set_install_popup_versions(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+
+        let handle = install_open_handle.clone();
+        let ui_handle = install_open_ui_handle.clone();
+        let pending_install = pending_install_open.clone();
+        let project_id = project_id.to_string();
+        let pack_name = pack_name.to_string();
+
+        handle.spawn(async move {
+            let Some(versions) = fetch_pack_versions(&project_id).await else {
+                report_progress(&ui_handle, "Konnte Versionen nicht laden.".to_string());
+                return;
+            };
+
+            let labels: Vec<SharedString> = versions
+                .iter()
+                .map(|v| {
+                    let mc_versions = v.game_versions.join(", ");
+                    SharedString::from(format!("{} ({})", v.version_number, mc_versions))
+                })
+                .collect();
+
+            // WICHTIG: Das Mutex wird NICHT im async-Block beschrieben, sondern
+            // erst innerhalb von upgrade_in_event_loop, wo wir wieder auf dem
+            // UI-Thread sind.
+            let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+                *pending_install.lock().unwrap() = Some(PendingInstall { project_id, pack_name, versions });
+
+                ui.set_install_popup_versions(ModelRc::new(VecModel::from(labels)));
+            });
+        });
+    });
+
+    // Install-Popup bestätigen: lädt jetzt WIRKLICH die Dateien der gewählten
+    // Version von Modrinth herunter. Erkennt anhand der primären Datei ob es
+    // sich um ein .mrpack (entpacken + referenzierte Mods laden) oder einzelne
+    // Jar-Dateien handelt (direkter Download in mods/). Fortschritt und Fehler
+    // werden laufend ins Popup geschrieben (install_popup_status). Zusätzlich
+    // wird das Projekt-Icon geladen/gecacht und in der instance.json vermerkt.
+    // Der Name der Instanz enthält die Pack-Version, damit mehrere Versionen
+    // desselben Packs nebeneinander installiert werden können statt sich zu
+    // überschreiben.
+    ui.on_browser_confirm_install(move |index| {
+        if index < 0 {
+            return; // keine Version ausgewählt
+        }
+
+        // Alle Werte die wir später im async-Block brauchen SYNCHRON aus dem
+        // Mutex rausziehen (klonen), weil Slint-Typen nicht garantiert Send
+        // sind und den Thread-Wechsel in handle.spawn() nicht mitmachen können.
+        let Some(pending) = pending_install_confirm.lock().unwrap().take() else {
+            println!("Keine ausstehende Installation gefunden");
+            return;
+        };
+
+        let Some(selected_version) = pending.versions.get(index as usize).cloned() else {
+            println!("Ungültiger Versions-Index: {}", index);
+            return;
+        };
+
+        let project_id = pending.project_id.clone();
+        let pack_name = pending.pack_name.clone();
+        let minecraft_version = selected_version.game_versions.first().cloned().unwrap_or_default();
+        let loader_kind = pick_loader_kind(&selected_version.loaders);
+        let instance_name = format!("{} ({})", pack_name, selected_version.version_number);
+
+        let handle = install_confirm_handle.clone();
+        let ui_handle = install_confirm_ui_handle.clone();
+
+        handle.spawn(async move {
+            let launcherDir = dirs::data_local_dir()
+                .expect("kein Local Data Dir")
+                .join("srusm");
+
+            let instance_dir = launcherDir.join("instances").join(&instance_name);
+            fs::create_dir_all(&instance_dir).expect("Konnte Instanz-Ordner nicht anlegen");
+
+            // Primäre Datei bestimmen (falls markiert, sonst einfach die erste)
+            let primary_file = selected_version
+                .files
+                .iter()
+                .find(|f| f.primary)
+                .or_else(|| selected_version.files.first())
+                .cloned();
+
+            let install_result = match &primary_file {
+                Some(file) if file.filename.ends_with(".mrpack") => {
+                    report_progress(&ui_handle, format!("Lade Modpack-Archiv: {}", file.filename));
+                    match download_bytes(&file.url).await {
+                        Ok(bytes) => install_mrpack(&instance_dir, bytes, &ui_handle).await,
+                        Err(e) => Err(e),
+                    }
+                }
+                _ => {
+                    // Kein .mrpack gefunden, also einzelne Dateien direkt laden
+                    download_files_direct(&instance_dir, &selected_version.files, &ui_handle).await
+                }
+            };
+
+            if let Err(e) = install_result {
+                println!("Installation fehlgeschlagen: {e}");
+                let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+                    ui.set_install_popup_status(SharedString::from(format!("Fehler: {e}")));
+                    ui.set_install_popup_installing(false);
+                    // Popup bewusst offen lassen, damit der Fehler sichtbar bleibt.
+                });
+                return; // instance.json wird NICHT geschrieben, keine kaputte Instanz in der Liste
+            }
+
+            // Icon des Packs laden/cachen (eigener Request, da wir hier nur
+            // project_id kennen, nicht mehr die icon_url aus der Suche).
+            report_progress(&ui_handle, "Lade Icon...".to_string());
+            let icon_cache_dir = launcherDir.join("icon_cache");
+            let icon_url = fetch_project_icon_url(&project_id).await;
+            let icon_path = cache_icon(&icon_cache_dir, &project_id, &icon_url).await;
+
+            report_progress(&ui_handle, "Fertig!".to_string());
+
+            let data = ModpackJsonData {
+                name: instance_name.clone(),
+                minecraft_version,
+                loader: loader_kind,
+                ram_mb: 2048,
+                icon_path: icon_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            };
+
+            let json = serde_json::to_string_pretty(&data).expect("Error Making json");
+            fs::write(instance_dir.join("instance.json"), json).expect("Error Writing File");
+
+            let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+                let model = ui.get_packs();
+                // Downcast auf VecModel, damit wir pushen können (gleiches Model
+                // das beim Start über set_packs gesetzt wurde).
+                if let Some(vec_model) = model.as_any().downcast_ref::<VecModel<ModpackInfo>>() {
+                    vec_model.push(ModpackInfo {
+                        name: data.name.into(),
+                        loader: data.loader.into(),
+                        minecraft_version: data.minecraft_version.into(),
+                        ram_mb: data.ram_mb,
+                        icon: load_icon(&icon_path),
+                    });
+                }
+
+                ui.set_install_popup_installing(false);
+                ui.set_install_popup_visible(false);
+            });
+        });
+    });
+
+    // Instanz-Details öffnen: liest Mods + Overrides + Icon der Instanz vom
+    // Datenträger und wechselt das Panel. Kein Netzwerk nötig, daher synchron
+    // statt spawn (läuft also bereits auf dem UI-Thread).
+    ui.on_open_instance_details(move |name| {
+        let ui = open_details_ui_handle.unwrap();
+
+        let launcherDir = dirs::data_local_dir()
+            .expect("kein Local Data Dir")
+            .join("srusm");
+        let instance_dir = launcherDir.join("instances").join(name.to_string());
+
+        let mods_raw = list_mod_files_raw(&instance_dir);
+        let overrides = load_instance_overrides(&instance_dir);
+
+        // instance.json lesen, um das Pack-Icon fürs Detail-Header zu laden (best effort)
+        let instance_icon_path: Option<PathBuf> = File::open(instance_dir.join("instance.json"))
+            .ok()
+            .and_then(|f| serde_json::from_reader::<_, ModpackJsonData>(BufReader::new(f)).ok())
+            .and_then(|c| c.icon_path)
+            .map(PathBuf::from);
+
+        ui.set_detail_instance_name(name.clone());
+        ui.set_detail_instance_icon(load_icon(&instance_icon_path));
+        ui.set_detail_mod_files(ModelRc::new(VecModel::from(
+            mods_raw.into_iter().map(build_mod_file_info).collect::<Vec<_>>(),
+        )));
+        ui.set_detail_overrides_enabled(overrides.enabled);
+        ui.set_detail_ram_mb(overrides.ram_mb);
+        ui.set_detail_java_path(overrides.java_path.into());
+        ui.set_detail_username(overrides.username.into());
+        ui.set_selected_panel("Instance Detail".into());
+    });
+
+    // Mod aktivieren/deaktivieren (Umbenennen), danach Liste neu laden damit
+    // die Anzeige (enabled/disabled, Button-Text) sofort aktuell ist.
+    ui.on_detail_toggle_mod(move |instance_name, filename| {
+        let ui = toggle_mod_ui_handle.unwrap();
+
+        let launcherDir = dirs::data_local_dir()
+            .expect("kein Local Data Dir")
+            .join("srusm");
+        let instance_dir = launcherDir.join("instances").join(instance_name.to_string());
+
+        toggle_mod_file(&instance_dir, &filename);
+
+        let mods_raw = list_mod_files_raw(&instance_dir);
+        ui.set_detail_mod_files(ModelRc::new(VecModel::from(
+            mods_raw.into_iter().map(build_mod_file_info).collect::<Vec<_>>(),
+        )));
+    });
+
+    // Mod entfernen, danach Liste neu laden.
+    ui.on_detail_remove_mod(move |instance_name, filename| {
+        let ui = remove_mod_ui_handle.unwrap();
+
+        let launcherDir = dirs::data_local_dir()
+            .expect("kein Local Data Dir")
+            .join("srusm");
+        let instance_dir = launcherDir.join("instances").join(instance_name.to_string());
+
+        remove_mod_file(&instance_dir, &filename);
+
+        let mods_raw = list_mod_files_raw(&instance_dir);
+        ui.set_detail_mod_files(ModelRc::new(VecModel::from(
+            mods_raw.into_iter().map(build_mod_file_info).collect::<Vec<_>>(),
+        )));
+    });
+
+    // Instanz-eigene Overrides speichern (instance_overrides.json).
+    ui.on_detail_save_overrides(move |instance_name, enabled, ram, java_path, username| {
+        let _ui = save_overrides_ui_handle.unwrap();
+
+        let launcherDir = dirs::data_local_dir()
+            .expect("kein Local Data Dir")
+            .join("srusm");
+        let instance_dir = launcherDir.join("instances").join(instance_name.to_string());
+
+        let overrides = InstanceOverrides {
+            enabled,
+            ram_mb: ram,
+            java_path: java_path.to_string(),
+            username: username.to_string(),
+        };
+
+        save_instance_overrides(&instance_dir, &overrides);
+
+        println!("Overrides für {} gespeichert: {:?}", instance_name, overrides);
+    });
+
+    // Add-Mod-Popup Suche: identisch zur Modpack-Suche, nur project_type "mod"
+    // statt "modpack" und Ziel-Model ist add_mod_results statt browser_packs.
+    // Cached ebenfalls das Icon pro Treffer, gleiches Prinzip wie on_browser_search.
+    ui.on_detail_add_mod_search(move |query| {
+        let handle = add_mod_search_handle.clone();
+        let ui_handle = add_mod_search_ui_handle.clone();
+        let query = query.to_string();
+
+        handle.spawn(async move {
+            let Some(hits) = search_projects(&query, "mod").await else {
+                report_mod_progress(&ui_handle, "Suche fehlgeschlagen.".to_string());
+                return;
+            };
+
+            let launcherDir = dirs::data_local_dir()
+                .expect("kein Local Data Dir")
+                .join("srusm");
+            let icon_cache_dir = launcherDir.join("icon_cache");
+
+            let mut items_raw = Vec::new();
+            for hit in hits {
+                let icon_path = cache_icon(&icon_cache_dir, &hit.project_id, &hit.icon_url).await;
+                items_raw.push((hit, icon_path));
+            }
+
+            let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+                let items: Vec<BrowserPackInfo> = items_raw
+                    .into_iter()
+                    .map(|(hit, icon_path)| BrowserPackInfo {
+                        project_id: hit.project_id.into(),
+                        name: hit.title.into(),
+                        summary: hit.description.into(),
+                        author: hit.author.into(),
+                        icon: load_icon(&icon_path),
+                    })
+                    .collect();
+
+                ui.set_add_mod_results(ModelRc::new(VecModel::from(items)));
+            });
+        });
+    });
+
+    // Mod direkt in die aktuell geöffnete Instanz installieren: liest instance.json
+    // für minecraft_version + loader (für die Versionsauswahl), lädt die passende
+    // Version herunter, cacht anschließend das Icon des Mods und trägt es in
+    // mod_icons.json ein, aktualisiert danach die Mod-Liste in der Detailansicht.
+    ui.on_detail_add_mod_install(move |instance_name, project_id, project_name| {
+        let handle = add_mod_install_handle.clone();
+        let ui_handle = add_mod_install_ui_handle.clone();
+        let instance_name = instance_name.to_string();
+        let project_id = project_id.to_string();
+
+        handle.spawn(async move {
+            let launcherDir = dirs::data_local_dir()
+                .expect("kein Local Data Dir")
+                .join("srusm");
+            let instance_dir = launcherDir.join("instances").join(&instance_name);
+            let icon_cache_dir = launcherDir.join("icon_cache");
+
+            // minecraft_version + loader aus instance.json lesen, um eine
+            // passende Mod-Version auszuwählen.
+            let Ok(file) = File::open(instance_dir.join("instance.json")) else {
+                report_mod_progress(&ui_handle, "Konnte instance.json nicht lesen.".to_string());
+                return;
+            };
+            let reader = BufReader::new(file);
+            let Ok(config) = serde_json::from_reader::<_, ModpackJsonData>(reader) else {
+                report_mod_progress(&ui_handle, "Konnte instance.json nicht parsen.".to_string());
+                return;
+            };
+
+            let result = install_mod_into_instance(
+                &instance_dir,
+                &project_id,
+                &config.minecraft_version,
+                &config.loader,
+                &ui_handle,
+            ).await;
+
+            match result {
+                Ok((filename, version_number)) => {
+                    // Icon für diesen Mod laden/cachen und in mod_icons.json eintragen
+                    let icon_url = fetch_project_icon_url(&project_id).await;
+                    let icon_path = cache_icon(&icon_cache_dir, &project_id, &icon_url).await;
+
+                    let mut icons = load_mod_icons(&instance_dir);
+                    if let Some(path) = &icon_path {
+                        icons.insert(filename.clone(), path.to_string_lossy().to_string());
+                    }
+                    save_mod_icons(&instance_dir, &icons);
+
+                    let mods_raw = list_mod_files_raw(&instance_dir);
+                    let message = format!("{} ({}) hinzugefügt", filename, version_number);
+
+                    let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+                        ui.set_add_mod_status(SharedString::from(message));
+                        ui.set_detail_mod_files(ModelRc::new(VecModel::from(
+                            mods_raw.into_iter().map(build_mod_file_info).collect::<Vec<_>>(),
+                        )));
+                    });
+                }
+                Err(e) => {
+                    println!("Mod-Installation fehlgeschlagen ({}): {}", project_name, e);
+                    report_mod_progress(&ui_handle, format!("Fehler: {e}"));
+                }
+            }
+        });
+    });
+
+    //ui.on_request_increase_value(move || {
+    //    let ui = ui_handle.unwrap();
+    //    ui.set_counter(ui.get_counter() + 1);
+    //});
+
+    ui.run()?;
+
+    Ok(())
+}
