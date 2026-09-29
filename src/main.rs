@@ -34,6 +34,10 @@ struct ModpackJsonData {
     // Feld weiterhin problemlos eingelesen werden können.
     #[serde(default)]
     icon_path: Option<String>,
+    // Vom Modpack vorgegebene Loader-Version (z.B. "0.16.9" bei Fabric). None = neueste stabile.
+    // #[serde(default)] damit ältere instance.json-Dateien ohne dieses Feld weiter laden.
+    #[serde(default)]
+    loader_version: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -60,6 +64,16 @@ struct LauncherSettings {
 }
 
 fn default_items_per_page() -> i32 { 12 }
+
+// Lädt settings.json aus dem Launcher-Ordner. Fehlt die Datei oder ist sie kaputt,
+// kommen die Defaults zurück, damit ein Spielstart nie daran scheitert.
+fn load_settings(launcher_dir: &Path) -> LauncherSettings {
+    let path = launcher_dir.join("settings.json");
+    let Ok(file) = File::open(&path) else {
+        return LauncherSettings::default();
+    };
+    serde_json::from_reader(BufReader::new(file)).unwrap_or_default()
+}
 
 // Default-Werte falls noch keine settings.json existiert (erster Start)
 impl Default for LauncherSettings {
@@ -794,6 +808,28 @@ fn mrpack_mc_and_loader(deps: &HashMap<String, String>) -> (String, String) {
         "none"
     };
     (mc, loader.to_string())
+}
+
+// Liest die vom .mrpack geforderte Loader-Version aus den "dependencies".
+// Die Schlüssel heißen je nach Loader anders (z.B. "fabric-loader" für Fabric).
+fn mrpack_loader_version(deps: &HashMap<String, String>, loader_kind: &str) -> Option<String> {
+    let key = match loader_kind {
+        "fabric" => "fabric-loader",
+        "quilt" => "quilt-loader",
+        "neoforge" => "neoforge",
+        "forge" => "forge",
+        _ => return None,
+    };
+    deps.get(key).cloned()
+}
+
+// Zerlegt eine CurseForge-Loader-ID wie "fabric-0.16.9" in ("fabric", Some("0.16.9")).
+// Eine ID ohne "-" (z.B. "none") ergibt (id, None).
+fn split_loader_id(id: &str) -> (String, Option<String>) {
+    match id.split_once('-') {
+        Some((kind, ver)) if !ver.is_empty() => (kind.to_lowercase(), Some(ver.to_string())),
+        _ => (id.to_lowercase(), None),
+    }
 }
 
 // Bereinigt einen eingefügten Pfad: Anführungszeichen (kommen z.B. beim Reinziehen ins Terminal),
@@ -1914,6 +1950,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             loader: modloader.to_string().to_lowercase(),
             ram_mb: 2048,
             icon_path: None, // manuell angelegte Instanz hat keine Modrinth-Herkunft, also kein Icon
+            loader_version: None, // manuell angelegt: immer die neueste stabile Version
         };
 
         let launcherDir = dirs::data_local_dir()
@@ -1966,7 +2003,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Username die Werte aus der instance.json bzw. dem aktuell
         // ausgewählten Account weiter unten.
         let overrides = load_instance_overrides(&instance_dir);
-        let effective_ram_mb = if overrides.enabled { overrides.ram_mb } else { config.ram_mb };
+        // RAM-Reihenfolge: Instanz-Override (wenn aktiviert) > globaler Wert aus dem Settings-Tab.
+        // config.ram_mb aus der instance.json wird bewusst NICHT mehr genutzt, weil dort bei
+        // jeder neuen Instanz fest 2048 steht und die Settings sonst nie greifen würden.
+        let settings = load_settings(&launcherDir);
+        let effective_ram_mb = if overrides.enabled { overrides.ram_mb } else { settings.default_ram_mb };
+        println!("RAM für den Start: {} MB", effective_ram_mb);
 
         // Ausgewählten Account merken; die eigentliche Auth-Methode (ggf. mit Token-Erneuerung,
         // das braucht Netzwerk) wird erst im async-Block gebaut.
@@ -2049,14 +2091,25 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
             } else {
-                let Some(version) =
-                    latest_loader_version(&config.loader, &config.minecraft_version).await
-                else {
-                    println!("Loader-Version nicht gefunden");
-                    return;
+                // Alte CurseForge-Instanzen haben noch die volle ID im loader-Feld
+                // ("fabric-0.16.9"), deshalb hier immer zerlegen.
+                let (loader_kind, id_version) = split_loader_id(&config.loader);
+
+                // Vorrang: gespeicherte Pack-Version > Version aus der ID > neueste stabile.
+                let version = match config.loader_version.clone().or(id_version) {
+                    Some(v) => v,
+                    None => {
+                        let Some(v) = latest_loader_version(&loader_kind, &config.minecraft_version).await else {
+                            println!("Loader-Version nicht gefunden");
+                            return;
+                        };
+                        v
+                    }
                 };
-                let Some(loader) = make_loader(&config.loader, version) else {
-                    println!("Unbekannter Loader: {}", config.loader);
+                println!("Nutze {} {}", loader_kind, version);
+
+                let Some(loader) = make_loader(&loader_kind, version) else {
+                    println!("Unbekannter Loader: {}", loader_kind);
                     return;
                 };
 
@@ -2087,7 +2140,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
 
             let _ = ui_handle.upgrade_in_event_loop(|_ui| {
-                println!("Minecraft gestartet");
+                println!("Minecraft beendet");
             });
         });
 
@@ -2638,7 +2691,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
 
                 // install_cf_modpack gibt (mc_version, loader) zurück!
-                let (minecraft_version, loader_kind) = install_result.unwrap();
+                // install_cf_modpack gibt (mc_version, "fabric-0.16.9") zurück -> zerlegen
+                let (minecraft_version, full_loader_id) = install_result.unwrap();
+                let (loader_kind, loader_version) = split_loader_id(&full_loader_id);
 
                 report_progress(&ui_handle, "Lade Icon...".to_string());
                 let icon_cache_dir = launcherDir.join("icon_cache");
@@ -2652,6 +2707,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     loader: loader_kind,
                     ram_mb: 2048,
                     icon_path: icon_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                    loader_version,
                 };
 
                 let json = serde_json::to_string_pretty(&data).expect("Error Making json");
@@ -2687,11 +2743,23 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                 let primary_file = selected_version.files.iter().find(|f| f.primary).or_else(|| selected_version.files.first()).cloned();
 
+                // Loader-Version aus dem .mrpack lesen, BEVOR es installiert wird
+                let mut loader_version: Option<String> = None;
+
+                // Loader-Version aus dem .mrpack lesen, BEVOR es installiert wird.
+                // Bleibt None, wenn kein .mrpack vorliegt oder die Version nicht drinsteht.
+                let mut loader_version: Option<String> = None;
+
                 let install_result = match &primary_file {
                     Some(file) if file.filename.ends_with(".mrpack") => {
                         report_progress(&ui_handle, format!("Lade Modpack-Archiv: {}", file.filename));
                         match download_bytes(&file.url).await {
-                            Ok(bytes) => install_mrpack(&instance_dir, bytes, &ui_handle).await.map(|_| ()),
+                            Ok(bytes) => {
+                                if let Ok(index) = read_mrpack_index(&bytes) {
+                                    loader_version = mrpack_loader_version(&index.dependencies, &loader_kind);
+                                }
+                                install_mrpack(&instance_dir, bytes, &ui_handle).await.map(|_| ())
+                            }
                             Err(e) => Err(e),
                         }
                     }
@@ -2721,6 +2789,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     loader: loader_kind,
                     ram_mb: 2048,
                     icon_path: icon_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+                    loader_version,
                 };
 
                 let json = serde_json::to_string_pretty(&data).expect("Error Making json");
@@ -2800,12 +2869,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                     return Err(e);
                 }
 
+                let loader_version = mrpack_loader_version(&index.dependencies, &loader);
+
                 let data = ModpackJsonData {
                     name: instance_name,
                     minecraft_version,
                     loader,
                     ram_mb: 2048,
                     icon_path: None, // .mrpack enthält kein Projekt-Icon
+                    loader_version,
                 };
 
                 let json = serde_json::to_string_pretty(&data)
@@ -3618,12 +3690,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                     return Err(e);
                 }
 
+                let (loader_kind, loader_version) = split_loader_id(&loader);
+
                 Ok(ModpackJsonData {
                     name: instance_name,
                     minecraft_version: mc_version,
-                    loader,
+                    loader: loader_kind,
                     ram_mb: 2048,
                     icon_path: None,
+                    loader_version,
                 })
             }.await;
 
