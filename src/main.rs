@@ -17,7 +17,9 @@ use std::collections::HashMap;
 use lyceris::minecraft::loader::{
     fabric::Fabric, forge::Forge, neoforge::NeoForge, quilt::Quilt,
 };
+use lyceris::minecraft::emitter::{Emitter, Event};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 
 slint::include_modules!();
 
@@ -1646,7 +1648,75 @@ async fn install_cf_modpack(
     Ok((mc_version, loader))
 }
 
+// Nimmt den gestarteten Minecraft-Prozess und spiegelt dessen Ausgabe live ins Terminal.
+// stdout und stderr werden jeweils in einem eigenen Task gelesen, damit keiner den
+// anderen blockiert. Danach wartet die Funktion, bis das Spiel beendet wird.
+async fn stream_minecraft_log(mut child: tokio::process::Child) {
+    // take() holt den Pipe-Handle aus dem Child heraus (bleibt None, falls lyceris
+    // die Ausgabe nicht umleitet, dann erbt der Prozess das Terminal ohnehin).
+    if let Some(stdout) = child.stdout.take() {
+        tokio::spawn(async move {
+            let mut lines = TokioBufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                println!("[MC] {line}");
+            }
+        });
+    }
+
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut lines = TokioBufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                eprintln!("[MC ERR] {line}");
+            }
+        });
+    }
+
+    // Auf das Ende des Spiels warten und den Exit-Status melden
+    match child.wait().await {
+        Ok(status) => println!("Minecraft beendet: {status}"),
+        Err(e) => println!("Fehler beim Warten auf Minecraft: {e}"),
+    }
+}
+
+// Sucht eine systemweit installierte GLFW an den üblichen Orten der großen Distributionen.
+// Gibt None zurück, wenn keine gefunden wird, dann bleibt es bei der GLFW, die Minecraft
+// selbst mitbringt (das ist bei den meisten Systemen völlig in Ordnung).
+#[cfg(target_os = "linux")]
+fn find_system_glfw() -> Option<&'static str> {
+    const CANDIDATES: [&str; 6] = [
+        "/usr/lib/libglfw.so",                      // Arch / CachyOS
+        "/usr/lib/libglfw.so.3",
+        "/usr/lib64/libglfw.so.3",                  // Fedora / openSUSE
+        "/usr/lib/x86_64-linux-gnu/libglfw.so.3",   // Debian / Ubuntu
+        "/usr/lib/aarch64-linux-gnu/libglfw.so.3",
+        "/usr/local/lib/libglfw.so",
+    ];
+    CANDIDATES.iter().copied().find(|p| Path::new(p).exists())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+
+    // NVIDIA-Workaround: wird an den Minecraft-Prozess vererbt.
+    // Muss vor dem Start weiterer Threads passieren (set_var ist sonst nicht thread-sicher).
+    // Ab Rust-Edition 2024 ist set_var "unsafe", in älteren Editionen ohne den unsafe-Block.
+    //unsafe { std::env::set_var("__GL_THREADED_OPTIMIZATIONS", "0"); }
+
+    // Wenn eine System-GLFW existiert, zwingen wir LWJGL dazu, sie zu benutzen.
+    // JAVA_TOOL_OPTIONS wird an jede JVM vererbt, also auch an den Minecraft-Prozess.
+    // Eine schon gesetzte Variable des Nutzers bleibt erhalten, wir hängen nur an.
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(glfw) = find_system_glfw() {
+            let flag = format!("-Dorg.lwjgl.glfw.libname={glfw}");
+            let value = match std::env::var("JAVA_TOOL_OPTIONS") {
+                Ok(existing) if !existing.is_empty() => format!("{existing} {flag}"),
+                _ => flag,
+            };
+            unsafe { std::env::set_var("JAVA_TOOL_OPTIONS", value); }
+        }
+    }
+
     let rt = Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -1945,6 +2015,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             .memory(Memory::Megabyte(effective_ram_mb as u64))
             .profile(Profile::new(name.to_string(), launcherDir.clone().join("instances")));
             
+            // lyceris liest stdout/stderr des Spiels selbst und schickt jede Zeile als
+            // Event::Console an den Emitter. Ohne Emitter (None) geht die Ausgabe verloren.
+            let emitter = Emitter::default();
+            emitter
+                .on(Event::Console, |line: String| {
+                    println!("[MC] {line}");
+                })
+                .await;
+
             if config.loader == "none" {
                 let cfg = builder.build();
 
@@ -1952,9 +2031,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                     println!("Install-Fehler: {:?}", e);
                     return;
                 }
-                if let Err(e) = launch(&cfg, None).await {
-                    println!("Start-Fehler: {:?}", e);
-                    return;
+                //if let Err(e) = launch(&cfg, None).await {
+                //    println!("Start-Fehler: {:?}", e);
+                //    return;
+                //}
+                match launch(&cfg, Some(&emitter)).await {
+                    // Wir müssen nur noch auf das Spielende warten, das Log kommt über den Emitter
+                    Ok(mut child) => {
+                        match child.wait().await {
+                            Ok(status) => println!("Minecraft beendet: {status}"),
+                            Err(e) => println!("Fehler beim Warten auf Minecraft: {e}"),
+                        }
+                    }
+                    Err(e) => {
+                        println!("Start-Fehler: {:?}", e);
+                        return;
+                    }
                 }
             } else {
                 let Some(version) =
@@ -1974,9 +2066,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                     println!("Install-Fehler: {:?}", e);
                     return;
                 }
-                if let Err(e) = launch(&cfg, None).await {
-                    println!("Start-Fehler: {:?}", e);
-                    return;
+                //if let Err(e) = launch(&cfg, None).await {
+                //    println!("Start-Fehler: {:?}", e);
+                //    return;
+                //}
+
+                match launch(&cfg, Some(&emitter)).await {
+                    // Wir müssen nur noch auf das Spielende warten, das Log kommt über den Emitter
+                    Ok(mut child) => {
+                        match child.wait().await {
+                            Ok(status) => println!("Minecraft beendet: {status}"),
+                            Err(e) => println!("Fehler beim Warten auf Minecraft: {e}"),
+                        }
+                    }
+                    Err(e) => {
+                        println!("Start-Fehler: {:?}", e);
+                        return;
+                    }
                 }
             }
 
