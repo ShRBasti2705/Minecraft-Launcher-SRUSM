@@ -314,6 +314,7 @@ struct ModFileEntry {
     display_name: String,
     enabled: bool,
     icon_path: Option<String>,
+    duplicate: bool, // Mod kommt mehrfach vor (orange in der UI)
 }
 
 // Verknüpft eine Mod-Datei mit ihrer Modrinth-Herkunft (project_id + gewählte
@@ -1374,18 +1375,16 @@ async fn install_mod_into_instance(
     Ok((file.filename.clone(), version.version_number.clone()))
 }
 
-// Listet alle Dateien im mods-Ordner einer Instanz für die Detailansicht auf,
-// als reine (Send-sichere) Daten - ohne slint::Image, das wird erst über
-// build_mod_file_info auf dem UI-Thread ergänzt. Deaktivierte Mods liegen als
-// "xyz.jar.disabled" vor (Konvention vieler Launcher), display_name zeigt den
-// Namen ohne dieses Suffix.
-fn list_mod_files_raw(instance_dir: &Path) -> Vec<ModFileEntry> {
+// Alle Dateien im mods-Ordner, ungefiltert. Erkennt außerdem doppelte Mods: gleiche Projekt-ID
+// (aus mods-list.json) bei mehr als einer aktiven Datei. Mods, die dort nicht stehen, werden
+// noch nicht erkannt: die Erkennung ist nur so zuverlässig wie die mods-list.json.
+fn list_mod_files_all(instance_dir: &Path) -> Vec<ModFileEntry> {
     let mods_dir = instance_dir.join("mods");
-    let Ok(entries) = fs::read_dir(&mods_dir) else {
-        return Vec::new(); // noch kein mods-Ordner vorhanden -> leere Liste
-    };
+    let Ok(entries) = fs::read_dir(&mods_dir) else { return Vec::new(); };
 
     let icons = load_mod_icons(instance_dir);
+    let pid_by_file: HashMap<String, String> = load_mods_list(instance_dir)
+        .into_iter().map(|e| (e.filename, e.project_id)).collect();
 
     let mut result: Vec<ModFileEntry> = entries
         .filter_map(|entry| entry.ok())
@@ -1395,13 +1394,35 @@ fn list_mod_files_raw(instance_dir: &Path) -> Vec<ModFileEntry> {
             let enabled = !filename.ends_with(".disabled");
             let display_name = filename.strip_suffix(".disabled").unwrap_or(&filename).to_string();
             let icon_path = icons.get(&display_name).cloned();
-
-            ModFileEntry { filename, display_name, enabled, icon_path }
+            ModFileEntry { filename, display_name, enabled, icon_path, duplicate: false }
         })
         .collect();
 
+    // Projekt-ID -> Anzahl aktiver Dateien; > 1 bedeutet doppelt.
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for e in result.iter().filter(|e| e.enabled) {
+        if let Some(pid) = pid_by_file.get(&e.display_name) {
+            *counts.entry(pid.clone()).or_insert(0) += 1;
+        }
+    }
+    for e in result.iter_mut().filter(|e| e.enabled) {
+        if let Some(pid) = pid_by_file.get(&e.display_name) {
+            e.duplicate = counts.get(pid).copied().unwrap_or(0) > 1;
+        }
+    }
+
     result.sort_by(|a, b| a.display_name.cmp(&b.display_name));
     result
+}
+
+// Die Liste für die UI: zusätzlich nach dem Suchfeld gefiltert (nur Dateiname, keine weiteren Filter).
+fn list_mod_files_raw(instance_dir: &Path) -> Vec<ModFileEntry> {
+    let mut all = list_mod_files_all(instance_dir);
+    let filter = mod_filter().lock().unwrap().to_lowercase();
+    if !filter.is_empty() {
+        all.retain(|e| e.display_name.to_lowercase().contains(&filter));
+    }
+    all
 }
 
 // Baut aus einem ModFileEntry (reine Daten) das Slint-ModFileInfo inkl.
@@ -1413,6 +1434,7 @@ fn build_mod_file_info(entry: ModFileEntry) -> ModFileInfo {
         display_name: entry.display_name.into(),
         enabled: entry.enabled,
         icon: load_icon(&icon_path),
+        duplicate: entry.duplicate,
     }
 }
 
@@ -1950,8 +1972,6 @@ fn refresh_running_ui(ui_handle: &Weak<AppWindow>, running: &RunningMap) {
     });
 }
 
-// Trägt den gestarteten Prozess in die Liste ein und wartet, bis er endet ODER
-// "Force Stop" gedrückt wird. Danach wird er wieder ausgetragen.
 async fn run_and_track(
     mut child: tokio::process::Child,
     name: String,
@@ -1961,22 +1981,354 @@ async fn run_and_track(
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     running.lock().unwrap().insert(name.clone(), tx);
     refresh_running_ui(&ui_handle, &running);
+    let started = std::time::Instant::now(); // Start der Spielzeit-Messung
 
     tokio::select! {
-        // Spiel wurde normal beendet
         result = child.wait() => match result {
             Ok(status) => println!("✅ Minecraft beendet: {status}"),
             Err(e) => println!("❌ Fehler beim Warten auf Minecraft: {e}"),
         },
-        // Force Stop: Ok(()) = rx matcht nur, wenn wirklich gesendet wurde
         Ok(()) = rx => {
             println!("🛑 Force Stop: {name}");
-            let _ = child.kill().await; // SIGKILL und wartet, bis der Prozess weg ist
+            let _ = child.kill().await;
         }
     }
 
+    // Spielzeit speichern: egal ob normal beendet, abgestürzt oder per Force Stop.
+    // (Stirbt der Launcher selbst, geht nur die laufende Session verloren.)
+    add_playtime_secs(&launcher_dir().join("instances").join(&name), started.elapsed().as_secs());
+    // playtime_tick erhöhen -> Kachel und Detailansicht berechnen den Text neu.
+    let _ = ui_handle.upgrade_in_event_loop(|ui| { ui.set_playtime_tick(ui.get_playtime_tick() + 1); });
+
     running.lock().unwrap().remove(&name);
     refresh_running_ui(&ui_handle, &running);
+}
+
+// ===================== Block 1: Misc-Einstellungen, Spielzeit, Presets =====================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EnvVar { name: String, value: String }
+
+// misc.json im Instanz-Ordner. Struct-weites #[serde(default)]: fehlende Felder in alten
+// Dateien werden mit Default::default() gefüllt, das Laden scheitert also nie an neuen Feldern.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct InstanceMisc {
+    jvm_args: String,            // freie zusätzliche JVM-Argumente (mit Leerzeichen getrennt)
+    jvm_preset: String,          // id aus JVM_PRESETS, "none" = kein Preset
+    env_vars: Vec<EnvVar>,       // zusätzliche Umgebungsvariablen
+    wrappers: Vec<String>,       // ids der aktivierten Wrapper (gamemode, mangohud, ...)
+    use_system_glfw: bool,       // Linux: System-GLFW statt der mitgelieferten (Standard: an)
+    quick_enabled: bool,         // Quick Play beim Start?
+    quick_server: String,        // Server-Adresse (hat Vorrang vor der Welt)
+    quick_world: String,         // Weltname
+    auto_fix_duplicates: bool,   // Duplikate automatisch beheben erlaubt (Standard: verboten)
+}
+
+impl Default for InstanceMisc {
+    fn default() -> Self {
+        Self {
+            jvm_args: String::new(),
+            jvm_preset: "none".to_string(),
+            env_vars: Vec::new(),
+            wrappers: Vec::new(),
+            use_system_glfw: true,
+            quick_enabled: false,
+            quick_server: String::new(),
+            quick_world: String::new(),
+            auto_fix_duplicates: false,
+        }
+    }
+}
+
+fn load_misc(instance_dir: &Path) -> InstanceMisc {
+    let Ok(file) = File::open(instance_dir.join("misc.json")) else { return InstanceMisc::default(); };
+    serde_json::from_reader(BufReader::new(file)).unwrap_or_default()
+}
+
+fn save_misc(instance_dir: &Path, misc: &InstanceMisc) {
+    if let Ok(json) = serde_json::to_string_pretty(misc) {
+        if let Err(e) = fs::write(instance_dir.join("misc.json"), json) {
+            println!("Konnte misc.json nicht speichern: {e}");
+        }
+    }
+}
+
+// Kurzform für den Launcher-Ordner (die neuen Teile nutzen ihn oft).
+fn launcher_dir() -> PathBuf {
+    dirs::data_local_dir().expect("kein Local Data Dir").join("srusm")
+}
+
+fn load_instance_config(instance_dir: &Path) -> Option<ModpackJsonData> {
+    let file = File::open(instance_dir.join("instance.json")).ok()?;
+    serde_json::from_reader(BufReader::new(file)).ok()
+}
+
+// ---- Spielzeit: eigene Datei, damit Speichern im Misc-Popup sie nie überschreibt ----
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Playtime { total_secs: u64 }
+
+fn load_playtime_secs(instance_dir: &Path) -> u64 {
+    let Ok(file) = File::open(instance_dir.join("playtime.json")) else { return 0; };
+    serde_json::from_reader::<_, Playtime>(BufReader::new(file)).map(|p| p.total_secs).unwrap_or(0)
+}
+
+fn add_playtime_secs(instance_dir: &Path, add: u64) {
+    let p = Playtime { total_secs: load_playtime_secs(instance_dir) + add };
+    if let Ok(json) = serde_json::to_string_pretty(&p) {
+        let _ = fs::write(instance_dir.join("playtime.json"), json);
+    }
+}
+
+fn format_playtime(secs: u64) -> String {
+    if secs == 0 { return "Noch nicht gespielt".to_string(); }
+    let (h, m) = (secs / 3600, (secs % 3600) / 60);
+    if h > 0 { format!("{h} h {m:02} min") } else if m > 0 { format!("{m} min") } else { "< 1 min".to_string() }
+}
+
+// ---- Mod-Suchfeld: der Filtertext liegt global, damit ALLE Stellen, die die Mod-Liste neu
+// aufbauen (Toggle, Entfernen, Add-Mod, ...), automatisch gefiltert werden, ohne geändert zu werden.
+static MOD_FILTER: OnceLock<Mutex<String>> = OnceLock::new();
+fn mod_filter() -> &'static Mutex<String> {
+    MOD_FILTER.get_or_init(|| Mutex::new(String::new()))
+}
+
+// ---- Java-/Minecraft-Hilfen ----
+// Grobe Zuordnung Minecraft-Version -> Java-Hauptversion, die lyceris/Mojang-Runtime nutzt.
+// Das neue Jahres-Schema (26.x) ist geraten (vermutlich Java 25), genau weiß ich es nicht.
+fn java_major_for(mc: &str) -> u32 {
+    let parts: Vec<u32> = mc.split('.').filter_map(|p| p.parse().ok()).collect();
+    match parts.as_slice() {
+        [1, minor, rest @ ..] => {
+            let patch = rest.first().copied().unwrap_or(0);
+            if *minor <= 16 { 8 }
+            else if *minor == 17 { 16 }
+            else if *minor < 20 || (*minor == 20 && patch < 5) { 17 }
+            else { 21 }
+        }
+        _ => 25,
+    }
+}
+
+// Quick Play (--quickPlayMultiplayer / --quickPlaySingleplayer) gibt es ab Minecraft 1.20.
+fn supports_quick_play(mc: &str) -> bool {
+    let parts: Vec<u32> = mc.split('.').filter_map(|p| p.parse().ok()).collect();
+    match parts.as_slice() { [1, minor, ..] => *minor >= 20, _ => true }
+}
+
+fn count_mods(instance_dir: &Path) -> usize {
+    fs::read_dir(instance_dir.join("mods")).map(|rd| {
+        rd.filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().ends_with(".jar")).count()
+    }).unwrap_or(0)
+}
+
+// ---- JVM-Presets ----
+struct JvmPreset { id: &'static str, title: &'static str, description: &'static str }
+
+const JVM_PRESETS: [JvmPreset; 4] = [
+    JvmPreset {
+        id: "none",
+        title: "Standard (keine zusätzlichen Flags)",
+        description: "Java nutzt seine eigenen Vorgaben. Für kleine bis mittlere Packs und wenig RAM (unter ca. 4 GB) meist die beste Wahl: Zusätzliche Flags bringen dort selten etwas.",
+    },
+    JvmPreset {
+        id: "mojang_default",
+        title: "Mojang-Standard (G1, kurze Pausen)",
+        description: "Die Flags, die der offizielle Launcher früher mitgegeben hat (G1 mit kurzer Ziel-Pause und großen Regionen). Sinnvoll bei 4-8 GB RAM, besonders für Minecraft bis 1.16: Java 8 nutzt sonst den Parallel-GC, der spürbare Pausen machen kann. Bei sehr großen Packs kann Aikar's besser passen.",
+    },
+    JvmPreset {
+        id: "aikar_client",
+        title: "Aikar's Flags (für den Client angepasst)",
+        description: "Bekannte G1-Feineinstellung, ursprünglich für Server, hier ohne AlwaysPreTouch, damit der Start nicht den ganzen RAM auf einmal belegt. Lohnt sich bei großen Modpacks (ab ca. 60-100 Mods) und mindestens 5-6 GB RAM, wenn Ruckler durch Garbage-Collection auftreten. Bei kleinen Packs oder wenig RAM bringt es nichts und kann sogar schaden.",
+    },
+    JvmPreset {
+        id: "zgc",
+        title: "ZGC (Low-Latency-Collector)",
+        description: "Sehr kurze GC-Pausen. Braucht Java 17 oder neuer (bei Java 21 mit der generationalen Variante) und Platz: ab ca. 8 GB RAM und mehreren CPU-Kernen sinnvoll. Bei knappem RAM kann er mehr Speicher brauchen als G1. Nicht für Minecraft mit Java 8.",
+    },
+];
+
+fn jvm_preset_flags(id: &str, java_major: u32) -> Vec<String> {
+    let flags: Vec<&str> = match id {
+        "mojang_default" => vec![
+            "-XX:+UnlockExperimentalVMOptions", "-XX:+UseG1GC", "-XX:G1NewSizePercent=20",
+            "-XX:G1ReservePercent=20", "-XX:MaxGCPauseMillis=50", "-XX:G1HeapRegionSize=32M",
+        ],
+        "aikar_client" => vec![
+            "-XX:+UseG1GC", "-XX:+ParallelRefProcEnabled", "-XX:MaxGCPauseMillis=200",
+            "-XX:+UnlockExperimentalVMOptions", "-XX:+DisableExplicitGC", "-XX:G1NewSizePercent=30",
+            "-XX:G1MaxNewSizePercent=40", "-XX:G1HeapRegionSize=8M", "-XX:G1ReservePercent=20",
+            "-XX:G1HeapWastePercent=5", "-XX:G1MixedGCCountTarget=4", "-XX:InitiatingHeapOccupancyPercent=15",
+            "-XX:G1MixedGCLiveThresholdPercent=90", "-XX:G1RSetUpdatingPauseTimePercent=5",
+            "-XX:SurvivorRatio=32", "-XX:+PerfDisableSharedMem", "-XX:MaxTenuringThreshold=1",
+        ],
+        // ZGC gibt es erst ab Java 17. -XX:+ZGenerational nur bei genau Java 21, in neueren
+        // Java-Versionen ist das Flag obsolet bzw. entfernt und könnte den Start verhindern.
+        "zgc" if java_major >= 17 => {
+            if java_major == 21 { vec!["-XX:+UseZGC", "-XX:+ZGenerational"] } else { vec!["-XX:+UseZGC"] }
+        }
+        _ => vec![],
+    };
+    flags.into_iter().map(String::from).collect()
+}
+
+// Auto-Vorschlag: geht bekannte Fälle von oben nach unten durch; der erste passende gewinnt.
+// Liefert (Preset-id, Begründungstext).
+fn suggest_jvm_preset(java_major: u32, mods: usize, ram_mb: i32, cores: usize) -> (&'static str, String) {
+    if ram_mb < 3072 {
+        return ("none", format!("Vorschlag: Standard. Nur {ram_mb} MB RAM sind zugewiesen, bei so wenig Speicher bringen GC-Flags kaum etwas. Erhöhe lieber zuerst den RAM."));
+    }
+    if java_major <= 8 {
+        if mods >= 100 && ram_mb >= 4096 {
+            return ("aikar_client", format!("Vorschlag: Aikar's Flags. Diese Instanz läuft mit Java 8 (Minecraft bis 1.16), hat {mods} Mods und {ram_mb} MB RAM. Java 8 startet sonst mit dem Parallel-GC, was bei großen Packs zu längeren Pausen führen kann. Ob es bei dir spürbar hilft, hängt vom Rechner ab: einfach testen."));
+        }
+        return ("mojang_default", format!("Vorschlag: Mojang-Standard. Java 8 (Minecraft bis 1.16) nutzt ohne Flags den Parallel-GC. G1 mit kurzer Ziel-Pause ist bei {mods} Mods und {ram_mb} MB RAM meist die ruhigere Wahl. Der Unterschied ist bei kleinen Packs gering."));
+    }
+    if mods < 30 && ram_mb <= 4096 {
+        return ("none", format!("Vorschlag: Standard. Mit {mods} Mods und {ram_mb} MB RAM ist das Pack klein; zusätzliche Flags bringen hier selten etwas."));
+    }
+    if java_major >= 17 && ram_mb >= 8192 && mods >= 150 && cores >= 6 {
+        return ("zgc", format!("Vorschlag: ZGC. {mods} Mods, {ram_mb} MB RAM und {cores} CPU-Kerne sind genug Platz für den Low-Latency-Collector, der GC-Ruckler am stärksten reduziert. Falls es Probleme gibt, nimm Aikar's Flags."));
+    }
+    if mods >= 60 && ram_mb >= 5120 {
+        return ("aikar_client", format!("Vorschlag: Aikar's Flags. {mods} Mods und {ram_mb} MB RAM sind ein Fall, in dem die G1-Feineinstellung gegen GC-Ruckler helfen kann. Sicher ist der Effekt nicht: einfach vergleichen."));
+    }
+    ("none", format!("Vorschlag: Standard. Bei {mods} Mods und {ram_mb} MB RAM kenne ich kein Preset mit sicherem Vorteil. Wenn du Ruckler siehst, probiere Aikar's Flags."))
+}
+
+// ---- Wrapper-Programme (id, Anzeigename, Programm im PATH, Hinweis) ----
+fn wrapper_defs() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+    if cfg!(target_os = "linux") {
+        vec![
+            ("gamemode", "GameMode (gamemoderun)", "gamemoderun", "Schaltet den CPU-Governor und weitere Optimierungen, solange das Spiel läuft (Paket: gamemode)."),
+            ("mangohud", "MangoHud", "mangohud", "FPS- und Performance-Overlay (Paket: mangohud). Bei Minecraft (OpenGL) hängt die Funktion vom Setup ab."),
+            ("prime_run", "prime-run", "prime-run", "Startet auf der NVIDIA-GPU bei Laptops mit Hybrid-Grafik (Paket: nvidia-prime)."),
+            ("gamescope", "Gamescope", "gamescope", "Mikro-Compositor (feste Auflösung, FPS-Limit). Kann je nach Setup Fenster- oder Eingabeprobleme machen."),
+        ]
+    } else if cfg!(target_os = "windows") {
+        vec![("high_priority", "Hohe Prozess-Priorität", "", "Startet das Spiel mit höherer Priorität, kann bei Hintergrundlast helfen. Experimentell.")]
+    } else {
+        vec![]
+    }
+}
+
+fn find_in_path(program: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else { return false; };
+    std::env::split_paths(&paths).any(|dir| dir.join(program).is_file())
+}
+
+fn wrapper_warning(enabled: &[String]) -> String {
+    let has = |id: &str| enabled.iter().any(|w| w == id);
+    let mut w: Vec<&str> = Vec::new();
+    if has("mangohud") && has("gamescope") {
+        w.push("MangoHud zusammen mit Gamescope kann doppelte Overlays erzeugen; Gamescope hat je nach Version ein eigenes (--mangoapp).");
+    }
+    if has("prime_run") {
+        w.push("prime-run ist nur auf Laptops mit zwei Grafikkarten sinnvoll.");
+    }
+    w.join(" ")
+}
+
+// ---- Was beim Spielstart an lyceris weitergegeben werden soll ----
+// JVM-Argumente: System-GLFW (Linux), Preset-Flags, freie Argumente. Reihenfolge = Priorität.
+fn collect_jvm_args(misc: &InstanceMisc, java_major: u32) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        if misc.use_system_glfw {
+            if let Some(glfw) = find_system_glfw() {
+                args.push(format!("-Dorg.lwjgl.glfw.libname={glfw}"));
+            }
+        }
+    }
+    args.extend(jvm_preset_flags(&misc.jvm_preset, java_major));
+    args.extend(misc.jvm_args.split_whitespace().map(String::from));
+    args
+}
+
+// Spiel-Argumente: Quick Play (nur ab 1.20). Der Server hat Vorrang vor der Welt.
+fn collect_game_args(misc: &InstanceMisc, mc: &str) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    if misc.quick_enabled && supports_quick_play(mc) {
+        if !misc.quick_server.trim().is_empty() {
+            args.push("--quickPlayMultiplayer".to_string());
+            args.push(misc.quick_server.trim().to_string());
+        } else if !misc.quick_world.trim().is_empty() {
+            args.push("--quickPlaySingleplayer".to_string());
+            args.push(misc.quick_world.trim().to_string());
+        }
+    }
+    args
+}
+
+// ---- Daten -> UI ----
+// Nur die Listen (Env + Wrapper): wird nach Hinzufügen/Entfernen genutzt, ohne ungespeicherte Textfelder zu überschreiben.
+fn push_misc_lists(ui: &AppWindow, instance_name: &str) {
+    let misc = load_misc(&launcher_dir().join("instances").join(instance_name));
+
+    let envs: Vec<EnvVarUi> = misc.env_vars.iter()
+        .map(|v| EnvVarUi { name: v.name.clone().into(), value: v.value.clone().into() })
+        .collect();
+    ui.set_misc_env_vars(ModelRc::new(VecModel::from(envs)));
+
+    let wrappers: Vec<WrapperUi> = wrapper_defs().into_iter().map(|(id, label, program, hint)| WrapperUi {
+        id: id.into(),
+        label: label.into(),
+        hint: hint.into(),
+        available: program.is_empty() || find_in_path(program), // nicht gefunden -> Checkbox gesperrt
+        enabled: misc.wrappers.iter().any(|w| w == id),
+    }).collect();
+    ui.set_misc_wrappers(ModelRc::new(VecModel::from(wrappers)));
+    ui.set_misc_wrapper_warning(wrapper_warning(&misc.wrappers).into());
+}
+
+// Alles fürs Misc-Popup (wird beim Öffnen aufgerufen).
+fn push_misc_to_ui(ui: &AppWindow, instance_name: &str) {
+    let launcher = launcher_dir();
+    let instance_dir = launcher.join("instances").join(instance_name);
+    let misc = load_misc(&instance_dir);
+    let mc = load_instance_config(&instance_dir).map(|c| c.minecraft_version).unwrap_or_default();
+
+    // Effektiver RAM wie beim Start: Instanz-Override (falls aktiv), sonst Settings.
+    let overrides = load_instance_overrides(&instance_dir);
+    let ram_mb = if overrides.enabled { overrides.ram_mb } else { load_settings(&launcher).default_ram_mb };
+
+    let java_major = java_major_for(&mc);
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let (suggested_id, suggestion) = suggest_jvm_preset(java_major, count_mods(&instance_dir), ram_mb, cores);
+
+    let presets: Vec<PresetUi> = JVM_PRESETS.iter().map(|p| PresetUi {
+        id: p.id.into(),
+        title: p.title.into(),
+        description: p.description.into(),
+        flags: jvm_preset_flags(p.id, java_major).join(" ").into(),
+        suggested: p.id == suggested_id,
+    }).collect();
+    ui.set_misc_presets(ModelRc::new(VecModel::from(presets)));
+    ui.set_misc_suggestion(suggestion.into());
+
+    ui.set_misc_jvm_args(misc.jvm_args.clone().into());
+    ui.set_misc_preset_id(misc.jvm_preset.clone().into());
+    ui.set_misc_use_system_glfw(misc.use_system_glfw);
+    ui.set_misc_auto_fix_dupes(misc.auto_fix_duplicates);
+    ui.set_misc_is_linux(cfg!(target_os = "linux"));
+    #[cfg(target_os = "linux")]
+    ui.set_misc_glfw_found(find_system_glfw().is_some());
+    ui.set_misc_status("".into());
+
+    push_misc_lists(ui, instance_name);
+}
+
+// Quick-Connect-Zeile der Detailansicht.
+fn push_quick_to_ui(ui: &AppWindow, instance_name: &str) {
+    let instance_dir = launcher_dir().join("instances").join(instance_name);
+    let misc = load_misc(&instance_dir);
+    let mc = load_instance_config(&instance_dir).map(|c| c.minecraft_version).unwrap_or_default();
+    ui.set_detail_quick_enabled(misc.quick_enabled);
+    ui.set_detail_quick_server(misc.quick_server.into());
+    ui.set_detail_quick_world(misc.quick_world.into());
+    ui.set_detail_quick_supported(supports_quick_play(&mc));
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -2325,6 +2677,31 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Some(acc) => lyceris::AuthMethod::Offline { username: acc.username, uuid: None },
                 None => lyceris::AuthMethod::Offline { username: "TestUser".to_string(), uuid: None },
             };
+
+                        // --- Misc-Einstellungen dieser Instanz (misc.json) ---
+            let misc = load_misc(&instance_dir);
+            let java_major = java_major_for(&config.minecraft_version);
+            let extra_jvm_args: Vec<String> = collect_jvm_args(&misc, java_major);   // System-GLFW + Preset + freie Args
+            let extra_game_args: Vec<String> = collect_game_args(&misc, &config.minecraft_version); // Quick Play
+            let extra_env: Vec<(String, String)> = misc.env_vars.iter().map(|v| (v.name.clone(), v.value.clone())).collect();
+            let active_wrappers: Vec<String> = misc.wrappers.clone();
+
+            // Kontrollausgabe, damit du siehst, was übergeben WERDEN soll (und die Variablen genutzt sind).
+            println!("🧩 Misc: JVM-Args {:?}", extra_jvm_args);
+            println!("🧩 Misc: Spiel-Args {:?}", extra_game_args);
+            println!("🧩 Misc: Env {:?}, Wrapper {:?}", extra_env, active_wrappers);
+
+            // TODO(lyceris) 1: extra_jvm_args an den ConfigBuilder übergeben. Er hat dafür eine
+            //   Builder-Methode `custom_java_args(Vec<String>)`, die launch() an den Java-Befehl hängt.
+            //   Wenn das läuft: den JAVA_TOOL_OPTIONS-Block in main() löschen (die GLFW-Flag kommt
+            //   dann pro Instanz aus collect_jvm_args, erst dann wirkt der Schalter "System-GLFW aus").
+            // TODO(lyceris) 2: extra_game_args analog über `custom_args(Vec<String>)` (Quick Play).
+            // TODO(lyceris) 3: extra_env und active_wrappers: in launch() ist kein Hook dafür sichtbar. Möglichkeiten:
+            //   (a) Env vor launch() im Launcher-Prozess setzen: wird vererbt, gilt aber global und kann
+            //       sich bei parallel laufenden Instanzen überschneiden (set_var ist in Multithread-Code unsafe).
+            //   (b) Falls Config/launch() den Java-Pfad überschreiben lässt: ein kleines Start-Skript als
+            //       "java" eintragen, das Env setzt und Wrapper (gamemoderun ...) vor das echte java stellt.
+            //   (c) den Prozess-Start von launch() nachbauen (größerer Umbau, vorher mit mir besprechen).
             
             let builder = ConfigBuilder::new(
                 &launcherDir.join("shared"),
@@ -3195,6 +3572,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             .expect("kein Local Data Dir")
             .join("srusm");
         let instance_dir = launcherDir.join("instances").join(name.to_string());
+
+        // Mod-Suchfeld bei jedem Instanzwechsel zurücksetzen
+        *mod_filter().lock().unwrap() = String::new();
+        ui.set_mod_filter("".into());
         
         // 1. Synchrones Laden der Basisdaten für sofortige UI-Anzeige
         let mods_raw = list_mod_files_raw(&instance_dir);
@@ -3247,6 +3628,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ui.set_detail_window_width(overrides.window_width);
         ui.set_detail_window_height(overrides.window_height);
         ui.set_detail_fullscreen(overrides.fullscreen);
+        push_quick_to_ui(&ui, name.as_str()); // Quick-Connect-Zeile füllen
         ui.set_selected_panel("Instance Detail".into());
 
         println!("📂 Detailansicht für '{}' geöffnet. Prüfe auf fehlende Icons...", name);
@@ -4111,6 +4493,102 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         });
+    });
+
+        // ===================== Block 2: Misc, Mod-Suche, Quick-Connect, Spielzeit =====================
+
+    // Spielzeit-Text für Kachel und Detailansicht. Das zweite Argument (Tick) wird nicht gelesen,
+    // es sorgt nur dafür, dass Slint die Abfrage nach jeder Session neu ausführt.
+    ui.on_instance_playtime(move |name, _tick| {
+        let dir = launcher_dir().join("instances").join(name.as_str());
+        SharedString::from(format_playtime(load_playtime_secs(&dir)))
+    });
+
+    // Misc-Popup öffnen: alles laden, dann anzeigen.
+    let h = ui.as_weak();
+    ui.on_misc_open(move |name| {
+        let ui = h.unwrap();
+        push_misc_to_ui(&ui, name.as_str());
+        ui.set_misc_popup_visible(true);
+    });
+
+    // Speichern-Button des Misc-Popups: Textfeld, Preset und die beiden Schalter.
+    let h = ui.as_weak();
+    ui.on_misc_save(move |name, jvm_args, preset_id, use_glfw, auto_fix| {
+        let ui = h.unwrap();
+        let dir = launcher_dir().join("instances").join(name.as_str());
+        let mut misc = load_misc(&dir); // frisch laden: Env/Wrapper wurden evtl. schon separat gespeichert
+        misc.jvm_args = jvm_args.trim().to_string();
+        misc.jvm_preset = preset_id.to_string();
+        misc.use_system_glfw = use_glfw;
+        misc.auto_fix_duplicates = auto_fix;
+        save_misc(&dir, &misc);
+        ui.set_misc_status("Gespeichert.".into());
+    });
+
+    // Umgebungsvariable hinzufügen (mit einfacher Prüfung des Namens).
+    let h = ui.as_weak();
+    ui.on_misc_env_add(move |name, var_name, var_value| {
+        let ui = h.unwrap();
+        let var_name = var_name.trim().to_string();
+        if var_name.is_empty() || var_name.contains('=') || var_name.contains(char::is_whitespace) {
+            ui.set_misc_status("Ungültiger Name (leer, '=' oder Leerzeichen sind nicht erlaubt).".into());
+            return;
+        }
+        let dir = launcher_dir().join("instances").join(name.as_str());
+        let mut misc = load_misc(&dir);
+        misc.env_vars.retain(|v| v.name != var_name); // gleicher Name überschreibt
+        misc.env_vars.push(EnvVar { name: var_name, value: var_value.to_string() });
+        save_misc(&dir, &misc);
+        ui.set_misc_status("".into());
+        push_misc_lists(&ui, name.as_str());
+    });
+
+    let h = ui.as_weak();
+    ui.on_misc_env_remove(move |name, index| {
+        let ui = h.unwrap();
+        let dir = launcher_dir().join("instances").join(name.as_str());
+        let mut misc = load_misc(&dir);
+        if index >= 0 && (index as usize) < misc.env_vars.len() {
+            misc.env_vars.remove(index as usize);
+            save_misc(&dir, &misc);
+        }
+        push_misc_lists(&ui, name.as_str());
+    });
+
+    let h = ui.as_weak();
+    ui.on_misc_wrapper_toggle(move |name, id, enabled| {
+        let ui = h.unwrap();
+        let dir = launcher_dir().join("instances").join(name.as_str());
+        let mut misc = load_misc(&dir);
+        misc.wrappers.retain(|w| w != id.as_str());
+        if enabled { misc.wrappers.push(id.to_string()); }
+        save_misc(&dir, &misc);
+        push_misc_lists(&ui, name.as_str()); // aktualisiert auch die Warnung
+    });
+
+    // Quick-Connect (Detailansicht).
+    let h = ui.as_weak();
+    ui.on_detail_save_quick(move |name, enabled, server, world| {
+        let _ui = h.unwrap();
+        let dir = launcher_dir().join("instances").join(name.as_str());
+        let mut misc = load_misc(&dir);
+        misc.quick_enabled = enabled;
+        misc.quick_server = server.trim().to_string();
+        misc.quick_world = world.trim().to_string();
+        save_misc(&dir, &misc);
+        println!("Quick-Connect für '{}' gespeichert.", name);
+    });
+
+    // Mod-Suchfeld: Filtertext merken, Liste neu aufbauen (list_mod_files_raw filtert).
+    let h = ui.as_weak();
+    ui.on_detail_filter_mods(move |name, text| {
+        let ui = h.unwrap();
+        *mod_filter().lock().unwrap() = text.to_string();
+        let dir = launcher_dir().join("instances").join(name.as_str());
+        ui.set_detail_mod_files(ModelRc::new(VecModel::from(
+            list_mod_files_raw(&dir).into_iter().map(build_mod_file_info).collect::<Vec<_>>(),
+        )));
     });
 
     //ui.on_request_increase_value(move || {

@@ -2,6 +2,7 @@ import { Button, GridBox, LineEdit, ComboBox, CheckBox, Slider, ScrollView, Spin
 
 component ModpackTile inherits Rectangle {
     in property <string> name;
+    in property <string> playtime; // Spielzeit-Text von Rust
     in property <image> icon;
 
     width: 120px;
@@ -15,9 +16,11 @@ component ModpackTile inherits Rectangle {
     }
 
     VerticalLayout {
-        spacing: 8px;
+        spacing: 6px;
         padding: 10px;
         alignment: center; //  Zentriert alle Elemente horizontal
+
+        Text { text: root.playtime; color: #7bdc8a; font-size: 10px; horizontal-alignment: center; height: 14px; overflow: elide; }
 
         // NEU: HorizontalLayout als Wrapper garantiert perfekte Zentrierung des Icons
         HorizontalLayout {
@@ -129,10 +132,14 @@ component BrowserTile inherits Rectangle {
 }
 
 struct ModpackInfo { name: string, minecraft_version: string, loader: string, ram_mb: int, icon: image }
-struct ModFileInfo { filename: string, display_name: string, enabled: bool, icon: image } // filename = tatsächlicher Dateiname auf Platte (ggf. mit ".disabled")
+struct ModFileInfo { filename: string, display_name: string, enabled: bool, icon: image, duplicate: bool } // duplicate = Mod kommt mehrfach vor (orange)
 struct AccountInfo { id: string, username: string, kind: string, selected: bool }
 
 struct RunningInstance { name: string }
+struct EnvVarUi { name: string, value: string }
+struct PresetUi { id: string, title: string, description: string, flags: string, suggested: bool }
+struct WrapperUi { id: string, label: string, hint: string, available: bool, enabled: bool }
+struct DuplicateUi { project_name: string, files: string } // Block 4: Gruppe "Doppelte Mods"
 
 // Ein-/ausklappbare Leiste am unteren Fensterrand mit den laufenden Instanzen.
 // Sie schiebt den Inhalt darüber nach oben (siehe AppWindow), statt ihn zu überdecken.
@@ -229,6 +236,22 @@ component RunningBar inherits Rectangle {
     }
 }
 
+// Rahmen für eine Karte im Misc-Popup: Titel, optionaler Hinweistext, darunter beliebiger Inhalt.
+component MiscCard inherits Rectangle {
+    in property <string> title;
+    in property <string> hint;
+    background: #232c3a;
+    border-radius: 6px;
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+        Text { text: root.title; color: white; font-weight: 700; font-size: 14px; }
+        if root.hint != "" : Text { text: root.hint; color: #a0a8b5; font-size: 12px; wrap: word-wrap; }
+        @children
+    }
+}
+
 export component AppWindow inherits Window {
 
     // Callbacks
@@ -263,6 +286,27 @@ export component AppWindow inherits Window {
     callback account_microsoft_open_browser();
     callback account_microsoft_submit(string); // eingefügte Adresse bzw. Code
     callback force_stop(string); // instance_name -> beendet den laufenden Prozess
+
+    // Spielzeit: "pure" = reine Abfrage. Das int-Argument (playtime_tick) erzwingt die Neuberechnung nach einer Session.
+    pure callback instance_playtime(string, int) -> string;
+    // Misc-Popup (Block 2)
+    callback misc_open(string);                               // instance -> lädt alles und öffnet das Popup
+    callback misc_save(string, string, string, bool, bool);   // instance, jvm_args, preset_id, use_system_glfw, auto_fix_duplicates
+    callback misc_env_add(string, string, string);            // instance, name, value
+    callback misc_env_remove(string, int);                    // instance, index
+    callback misc_wrapper_toggle(string, string, bool);       // instance, wrapper_id, enabled
+    callback detail_save_quick(string, bool, string, string); // instance, enabled, server, world
+    callback detail_filter_mods(string, string);              // instance, suchtext
+    // Manage Instanz (Block 3)
+    callback manage_open(string);
+    callback manage_duplicate(string, string);                // instance, neuer Name
+    callback manage_rename(string, string);                   // instance, neuer Name
+    callback manage_export(string);
+    callback manage_delete(string);
+    callback manage_loader_check(string, string);             // instance, Ziel-Version -> Resolver-Test, dann Bestätigung
+    callback manage_loader_latest(string);
+    // Doppelte Mods (Block 4)
+    callback duplicates_fix(string);
 
     // Vars
     in-out property <bool> popup_new_instance: false;
@@ -310,6 +354,9 @@ export component AppWindow inherits Window {
     in property <[BrowserPackInfo]> add_mod_results;
     in-out property <string> add_mod_status: "";
 
+    // Misc-Popup (Detailansicht): viele kleine Extras/Einstellungen in einer horizontal scrollbaren Reihe
+    in-out property <bool> misc_popup_visible: false;
+
     // Account-Verwaltung State
     in property <[AccountInfo]> accounts;
     in-out property <string> accounts_status: "";
@@ -325,6 +372,33 @@ export component AppWindow inherits Window {
     // Laufende Instanzen (von Rust befüllt) + Zustand der unteren Leiste
     in property <[RunningInstance]> running_instances;
     in-out property <bool> running_bar_expanded: false;
+
+    in-out property <int> playtime_tick: 0;
+    in-out property <string> mod_filter: "";
+    // Misc
+    in-out property <string> misc_jvm_args: "";
+    in-out property <string> misc_preset_id: "none";
+    in property <[PresetUi]> misc_presets;
+    in property <string> misc_suggestion: "";
+    in property <[EnvVarUi]> misc_env_vars;
+    in property <[WrapperUi]> misc_wrappers;
+    in property <string> misc_wrapper_warning: "";
+    in property <bool> misc_is_linux: false;
+    in property <bool> misc_glfw_found: false;
+    in-out property <bool> misc_use_system_glfw: true;
+    in-out property <bool> misc_auto_fix_dupes: false;
+    in-out property <string> misc_status: "";
+    // Quick-Connect (Detailansicht)
+    in-out property <bool> detail_quick_enabled: false;
+    in-out property <string> detail_quick_server: "";
+    in-out property <string> detail_quick_world: "";
+    in property <bool> detail_quick_supported: true;
+    // Doppelte Mods + Manage Instanz
+    in property <[DuplicateUi]> detail_duplicates;
+    in-out property <bool> manage_popup_visible: false;
+    in-out property <string> manage_status: "";
+    in property <[string]> manage_loader_versions;
+    in-out property <string> manage_loader_current: "";
 
     // NEU: Aktuelle Quelle im Browser (Standard ist Modrinth)
     in-out property <string> browser_source: "Modrinth";
@@ -471,6 +545,7 @@ export component AppWindow inherits Window {
                                 row: floor(i / instances_scroll.cols);
                                 col: mod(i, instances_scroll.cols);
                                 name: pack.name;
+                                playtime: root.instance_playtime(pack.name, root.playtime_tick);
                                 icon: pack.icon;
                                 background: #333;
                                 modpack_play(n) => { root.modpack_play(n) }
@@ -742,6 +817,7 @@ export component AppWindow inherits Window {
                             color: white;
                             vertical-alignment: center;
                         }
+                        Text { text: "Spielzeit: " + root.instance_playtime(root.detail_instance_name, root.playtime_tick); color: #7bdc8a; font-size: 12px; vertical-alignment: center; }
                     }
 
                     Text { text: "Mods"; font-size: 16px; font-weight: 700; color: white; }
@@ -749,6 +825,12 @@ export component AppWindow inherits Window {
                         max-height: 30px;
                         spacing: 10px;
                         alignment: start; // Buttons behalten ihre feste Breite und stehen links nebeneinander
+
+                        LineEdit {
+                            placeholder-text: "Mods durchsuchen...";
+                            text <=> root.mod_filter;
+                            edited(t) => { root.detail_filter_mods(root.detail_instance_name, t) }
+                        }
 
                         Button {
                             text: "+ Mod hinzufügen";
@@ -764,6 +846,8 @@ export component AppWindow inherits Window {
                             width: 160px;
                             clicked => { root.detail_open_folder(root.detail_instance_name) }
                         }
+                        Button { text: "Misc"; width: 80px; clicked => { root.misc_open(root.detail_instance_name) } }
+                        Button { text: "Manage Instanz"; width: 130px; clicked => { root.manage_open(root.detail_instance_name) } }
                     }
 
                     mods_scroll := ScrollView {
@@ -777,7 +861,7 @@ export component AppWindow inherits Window {
                                 Image { source: mod_file.icon; width: 20px; height: 20px; }
                                 Text {
                                     text: mod_file.display_name;
-                                    color: mod_file.enabled ? white : #7a8291;
+                                    color: mod_file.duplicate ? #ff9a2e : (mod_file.enabled ? white : #7a8291); // orange = doppelt
                                     vertical-alignment: center;
                                     horizontal-stretch: 1;
                                     overflow: elide;
@@ -795,6 +879,30 @@ export component AppWindow inherits Window {
                                     clicked => { root.detail_remove_mod(root.detail_instance_name, mod_file.filename) }
                                 }
                             }
+                        }
+                    }
+                    
+                    Rectangle {
+                        background: #232c3a;
+                        border-radius: 6px;
+                        height: root.detail_quick_supported ? 46px : 66px;
+
+                        VerticalLayout {
+                            padding: 8px;
+                            spacing: 4px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                CheckBox { text: "Direkt verbinden"; enabled: root.detail_quick_supported; checked <=> root.detail_quick_enabled; }
+                                LineEdit { placeholder-text: "Server (z.B. mc.example.net)"; enabled: root.detail_quick_supported; text <=> root.detail_quick_server; }
+                                LineEdit { placeholder-text: "oder Weltname"; enabled: root.detail_quick_supported; text <=> root.detail_quick_world; }
+                                Button {
+                                    text: "Speichern";
+                                    width: 90px;
+                                    enabled: root.detail_quick_supported;
+                                    clicked => { root.detail_save_quick(root.detail_instance_name, root.detail_quick_enabled, root.detail_quick_server, root.detail_quick_world) }
+                                }
+                            }
+                            if !root.detail_quick_supported : Text { text: "Quick Play gibt es erst ab Minecraft 1.20."; color: #ff9a2e; font-size: 11px; }
                         }
                     }
 
@@ -978,6 +1086,34 @@ export component AppWindow inherits Window {
         }
     }
 
+    if manage_popup_visible : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #00000099;
+        TouchArea { clicked => { root.manage_popup_visible = false } }
+
+        Rectangle {
+            width: 60%;
+            height: 60%;
+            x: parent.width/2 - self.width/2;
+            y: parent.height/2 - self.height/2;
+            background: #2c3747;
+            border-radius: 6px;
+            TouchArea {}
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+                HorizontalLayout {
+                    max-height: 30px;
+                    Text { text: "Manage: " + root.detail_instance_name; color: white; font-size: 16px; font-weight: 700; vertical-alignment: center; horizontal-stretch: 1; }
+                    Button { text: "Schließen"; width: 90px; clicked => { root.manage_popup_visible = false } }
+                }
+                Rectangle { vertical-stretch: 1; } // Inhalt kommt in Block 3
+            }
+        }
+    }
+
     // Install-Popup: Version eines Modpacks aus dem Browser auswählen.
     // Mehrfach-Installation ist möglich, da jede Bestätigung eine neue,
     // eigene Instanz anlegt (Name enthält die gewählte Version) statt eine
@@ -1149,6 +1285,180 @@ export component AppWindow inherits Window {
             }
         }
     }
+
+    // Misc-Popup: bewusst leer, nur Rahmen + horizontal scrollbare Reihe.
+    // Neue Features kommen später als einzelne "Karten" in das HorizontalLayout unten.
+    if misc_popup_visible : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #00000099; // abgedunkelter Hintergrund wie bei den anderen Popups
+
+        TouchArea { clicked => { root.misc_popup_visible = false } } // Klick daneben schließt
+
+        Rectangle {
+            width: 80%;
+            height: 50%;
+            x: parent.width/2 - self.width/2;
+            y: parent.height/2 - self.height/2;
+            background: #2c3747;
+            border-radius: 6px;
+
+            TouchArea {} // fängt Klicks ab, damit sie nicht "durchfallen" und das Popup schließen
+
+            VerticalLayout {
+                spacing: 12px;
+                padding: 16px;
+
+                // Titelzeile: Instanzname + Schließen-Button rechts
+                HorizontalLayout {
+                    max-height: 30px;
+                    spacing: 10px;
+
+                    Text {
+                        text: "Misc: " + root.detail_instance_name;
+                        color: white;
+                        font-size: 16px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                    Button {
+                        text: "Schließen";
+                        width: 90px;
+                        clicked => { root.misc_popup_visible = false }
+                    }
+                }
+
+                // Der Bereich für die Karten: füllt den Rest des Popups, scrollt bei vielen Karten seitlich
+                misc_scroll := ScrollView {
+                    vertical-stretch: 1;
+
+                    VerticalLayout {
+                        alignment: start;
+                        spacing: 12px;
+                        padding: 4px;
+
+                        // 1. Freie JVM-Argumente
+                        MiscCard {
+                            title: "Zusätzliche JVM-Argumente";
+                            hint: "Werden beim Start an Java übergeben, mit Leerzeichen trennen, z.B. -Xss2M -Dfoo=bar.";
+                            LineEdit { text <=> root.misc_jvm_args; placeholder-text: "-Xss2M ..."; }
+                        }
+
+                        // 2. JVM-Presets mit Erklärung und Vorschlag
+                        MiscCard {
+                            title: "JVM-Preset";
+                            hint: root.misc_suggestion;
+                            for p in root.misc_presets : Rectangle {
+                                background: root.misc_preset_id == p.id ? #2c4a66 : #1b2330;
+                                border-radius: 4px;
+                                VerticalLayout {
+                                    padding: 8px;
+                                    spacing: 4px;
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: p.title + (p.suggested ? "  (Vorschlag)" : "");
+                                            color: p.suggested ? #7bdc8a : white;
+                                            font-weight: 700;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                        Button {
+                                            text: root.misc_preset_id == p.id ? "Gewählt" : "Wählen";
+                                            width: 90px;
+                                            height: 24px;
+                                            enabled: root.misc_preset_id != p.id;
+                                            clicked => { root.misc_preset_id = p.id }
+                                        }
+                                    }
+                                    Text { text: p.description; wrap: word-wrap; color: #a0a8b5; font-size: 12px; }
+                                    if p.flags != "" : Text { text: p.flags; wrap: word-wrap; color: #7a8291; font-size: 10px; }
+                                }
+                            }
+                        }
+
+                        // 3. Umgebungsvariablen
+                        MiscCard {
+                            title: "Umgebungsvariablen";
+                            hint: "Name/Wert-Paare, die dem Spielprozess mitgegeben werden (z.B. __GL_THREADED_OPTIMIZATIONS = 0).";
+                            for v[i] in root.misc_env_vars : HorizontalLayout {
+                                height: 26px;
+                                spacing: 8px;
+                                Text { text: v.name + " = " + v.value; color: white; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                Button { text: "Entfernen"; width: 90px; height: 24px; clicked => { root.misc_env_remove(root.detail_instance_name, i) } }
+                            }
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                env_name_box := LineEdit { placeholder-text: "NAME"; width: 170px; }
+                                env_value_box := LineEdit { placeholder-text: "Wert"; horizontal-stretch: 1; }
+                                Button {
+                                    text: "Hinzufügen";
+                                    width: 100px;
+                                    clicked => {
+                                        root.misc_env_add(root.detail_instance_name, env_name_box.text, env_value_box.text);
+                                        env_name_box.text = "";
+                                        env_value_box.text = "";
+                                    }
+                                }
+                            }
+                        }
+
+                        // 4. Wrapper-Programme (je nach Betriebssystem)
+                        MiscCard {
+                            title: "Wrapper-Programme";
+                            hint: "Nur Programme, die auf diesem System gefunden wurden, sind wählbar.";
+                            if root.misc_wrappers.length == 0 : Text { text: "Für dieses System gibt es keine passenden Wrapper."; color: #7a8291; font-size: 12px; }
+                            for w in root.misc_wrappers : VerticalLayout {
+                                spacing: 2px;
+                                CheckBox {
+                                    text: w.label + (w.available ? "" : "  (nicht gefunden)");
+                                    checked: w.enabled;
+                                    enabled: w.available;
+                                    toggled => { root.misc_wrapper_toggle(root.detail_instance_name, w.id, self.checked) }
+                                }
+                                Text { text: w.hint; color: #7a8291; font-size: 11px; wrap: word-wrap; }
+                            }
+                            if root.misc_wrapper_warning != "" : Text { text: root.misc_wrapper_warning; color: #ff9a2e; font-size: 12px; wrap: word-wrap; }
+                        }
+
+                        // 5. System-GLFW (nur Linux)
+                        if root.misc_is_linux : MiscCard {
+                            title: "System-GLFW verwenden";
+                            hint: root.misc_glfw_found
+                                ? "Nutzt die auf deinem System installierte GLFW statt der mitgelieferten. Hilft, wenn das Fenster beim Start abstürzt (Standard: an)."
+                                : "Keine System-GLFW gefunden (z.B. sudo pacman -S glfw oder sudo apt install libglfw3). Der Schalter hat dann keine Wirkung.";
+                            CheckBox { text: "System-GLFW verwenden"; checked <=> root.misc_use_system_glfw; enabled: root.misc_glfw_found; }
+                        }
+
+                        // 6. Doppelte Mods: Erlaubnis zum automatischen Beheben (Logik in Block 4)
+                        MiscCard {
+                            title: "Doppelte Mods";
+                            hint: "Doppelte Mods erscheinen in der Mod-Liste orange. Das automatische Beheben ist standardmäßig verboten; auch wenn du es erlaubst, wird nichts ohne deine Bestätigung geändert.";
+                            CheckBox { text: "Automatisches Beheben erlauben"; checked <=> root.misc_auto_fix_dupes; }
+                        }
+
+                        // Speichern (Textfelder, Preset, Schalter). Env und Wrapper werden sofort gespeichert.
+                        HorizontalLayout {
+                            height: 30px;
+                            spacing: 10px;
+                            Button {
+                                text: "Speichern";
+                                primary: true;
+                                width: 120px;
+                                clicked => {
+                                    root.misc_save(root.detail_instance_name, root.misc_jvm_args, root.misc_preset_id, root.misc_use_system_glfw, root.misc_auto_fix_dupes)
+                                }
+                            }
+                            Text { text: root.misc_status; color: #a0d8a0; vertical-alignment: center; }
+                        }
+                    }
+                }
+            }
+        }
+    }   
 
     if compat_popup_visible : Rectangle {
         width: 100%; height: 100%;
