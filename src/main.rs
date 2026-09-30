@@ -1668,6 +1668,56 @@ fn pick_loader_kind(modrinth_loaders: &[String]) -> String {
     "none".to_string()
 }
 
+// Patcht die Forge version.json im Cache, um minecraftArguments zu arguments zu konvertieren.
+// Forge < 1.13 verwendet minecraftArguments (String), aber lyceris erwartet arguments (JSON-Objekt).
+fn patch_forge_version_json(launcher_dir: &Path, mc_version: &str, loader_version: &str) {
+    let version_json_path = launcher_dir
+        .join("shared")
+        .join(".forge")
+        .join("profiles")
+        .join(format!("{}-{}", mc_version, loader_version))
+        .join(format!("version-{}-{}.json", mc_version, loader_version));
+    
+    if !version_json_path.exists() {
+        // Ausgabe hilft, falls der von uns angenommene Pfad nicht zu lyceris passt
+        println!("⚠️ Forge version.json nicht gefunden unter: {}", version_json_path.display());
+        return;
+    }
+    
+    let content = match fs::read_to_string(&version_json_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    
+    // Bereits gepatcht? Dann nichts tun
+    if content.contains("\"arguments\"") {
+        return;
+    }
+    
+    // minecraftArguments zu arguments konvertieren
+    if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) {
+        if let Some(mc_args) = json.get("minecraftArguments").and_then(|v| v.as_str()) {
+            let args_array: Vec<serde_json::Value> = mc_args
+                .split_whitespace()
+                .map(|s| serde_json::Value::String(s.to_string()))
+                .collect();
+            
+            json["arguments"] = serde_json::json!({
+                "game": args_array,
+                "jvm": []
+            });
+            
+            if let Ok(new_content) = serde_json::to_string_pretty(&json) {
+                if let Err(e) = fs::write(&version_json_path, new_content) {
+                    println!("⚠️ Konnte version.json nicht patchen: {}", e);
+                } else {
+                    println!("✅ Forge version.json erfolgreich gepatcht für {}-{}", mc_version, loader_version);
+                }
+            }
+        }
+    }
+}
+
 async fn install_cf_modpack(
     instance_dir: &PathBuf,
     zip_bytes: Vec<u8>,
@@ -1861,8 +1911,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let add_mod_search_handle = handle.clone();
     let add_mod_install_handle = handle.clone();
     let compat_apply_handle = handle.clone();
-    let open_details_bg_handle = handle.clone(); // <-- NEU: Für den Icon-Nachlade-Task
-    let open_details_handle = handle.clone(); // <-- NEU: Für den Hintergrund-Task im Detail-Tab
+    let open_details_bg_handle = handle.clone(); // Für den Icon-Nachlade-Task
+    let _open_details_handle = handle.clone(); // Unterstrich unterdrückt die "unused variable" Warnung
 
     // Speichert Pack-Name + geladene Versionen für das aktuell offene
     // Install-Popup, damit on_browser_confirm_install (bekommt nur einen
@@ -2037,61 +2087,73 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     // Play Instance
+        // Play Instance
     ui.on_modpack_play(move |name| {
         let _ui = modpack_play_ui_handle.unwrap();
         let handle = handle.clone();
         let ui_handle = ui_handle.clone();
-
         let launcherDir = dirs::data_local_dir()
             .expect("kein Local Data Dir")
             .join("srusm");
-
-        println!("Modpack Name: {}", name);
-
-        println!("{:?}", &launcherDir.join("instances/").join(&name).join("instance.json"));
         
+        println!("");
+        println!("═══════════════════════════════════════════════════════");
+        println!("🎮 START: {}", name);
+        println!("═══════════════════════════════════════════════════════");
+        
+        println!("📂 [1/7] Lese Instanz-Konfiguration...");
         let instance_dir = launcherDir.join("instances/").join(&name);
-
         let file = File::open(instance_dir.join("instance.json")).expect("Error during file Reading of instance.json");
         let reader = BufReader::new(file);
-        
         let config: ModpackJsonData = serde_json::from_reader(reader).expect("Error during extracting data out of instance.json");
-
-        println!("Modpack Name: {}\nMinecraft Version: {}\nModLoader: {}\n Ram MB: {}mb", name, config.minecraft_version, config.loader, config.ram_mb);
-
-        // Instanz-eigene Overrides laden: wenn aktiviert, überschreiben RAM und
-        // Username die Werte aus der instance.json bzw. dem aktuell
-        // ausgewählten Account weiter unten.
+        
+        println!("   ├─ Minecraft Version: {}", config.minecraft_version);
+        println!("   ├─ Loader: {}", config.loader);
+        println!("   └─ Icon: {}", if config.icon_path.is_some() { "vorhanden" } else { "fehlt" });
+        
+        println!("⚙️  [2/7] Lade Instanz-Overrides...");
         let overrides = load_instance_overrides(&instance_dir);
-        // RAM-Reihenfolge: Instanz-Override (wenn aktiviert) > globaler Wert aus dem Settings-Tab.
-        // config.ram_mb aus der instance.json wird bewusst NICHT mehr genutzt, weil dort bei
-        // jeder neuen Instanz fest 2048 steht und die Settings sonst nie greifen würden.
+        if overrides.enabled {
+            println!("   └─ Overrides aktiviert (RAM: {} MB, Username: {})", overrides.ram_mb, overrides.username);
+        } else {
+            println!("   └─ Overrides deaktiviert, nutze globale Settings");
+        }
+        
+        println!("💾 [3/7] Berechne effektiven RAM...");
         let settings = load_settings(&launcherDir);
         let effective_ram_mb = if overrides.enabled { overrides.ram_mb } else { settings.default_ram_mb };
-        println!("RAM für den Start: {} MB", effective_ram_mb);
-
-        // Ausgewählten Account merken; die eigentliche Auth-Methode (ggf. mit Token-Erneuerung,
-        // das braucht Netzwerk) wird erst im async-Block gebaut.
+        println!("   └─ Effektiver RAM: {} MB", effective_ram_mb);
+        
+        println!("👤 [4/7] Bestimme Authentifizierung...");
         let accounts = load_accounts(&launcherDir);
         let selected_account: Option<AccountEntry> = accounts
             .selected_id
             .as_ref()
             .and_then(|id| accounts.accounts.iter().find(|a| &a.id == id))
             .cloned();
-
         
-        // Instanz-Override hat Vorrang und startet immer als Offline-Name
         let override_username: Option<String> = if overrides.enabled { Some(overrides.username.clone()) } else { None };
-
+        
+        let auth_type = if override_username.is_some() {
+            "Offline (Override)"
+        } else {
+            match &selected_account {
+                Some(acc) if acc.kind == "microsoft" => "Microsoft",
+                Some(acc) => "Offline",
+                None => "Offline (Fallback: TestUser)",
+            }
+        };
+        println!("   └─ Auth-Typ: {}", auth_type);
+        
         let _launcher_dir = launcherDir.clone();
         let ui_handle = ui_handle.clone();
         let handle = handle.clone();
         let name = name.to_string();
-
+        
         handle.spawn(async move {
-            println!("Starte {}", name);
-
-            // Auth bestimmen: Override > Microsoft-Account > Offline-Account > "TestUser"
+            println!("🚀 [5/7] Starte Installation/Setup...");
+            
+            // Auth bestimmen
             let auth = if let Some(name) = override_username {
                 lyceris::AuthMethod::Offline { username: name, uuid: None }
             } else {
@@ -2099,7 +2161,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     Some(acc) if acc.kind == "microsoft" => match microsoft_auth_for(&launcherDir, acc).await {
                         Ok(auth) => auth,
                         Err(e) => {
-                            println!("Microsoft-Anmeldung fehlgeschlagen: {e}");
+                            println!("❌ Microsoft-Anmeldung fehlgeschlagen: {e}");
                             push_debug_log(&ui_handle, format!("Microsoft-Anmeldung fehlgeschlagen: {e}"));
                             return;
                         }
@@ -2108,7 +2170,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     None => lyceris::AuthMethod::Offline { username: "TestUser".to_string(), uuid: None },
                 }
             };
-
+            
             let builder = ConfigBuilder::new(
                 &launcherDir.join("shared"),
                 config.minecraft_version.clone(),
@@ -2117,120 +2179,109 @@ fn main() -> Result<(), Box<dyn Error>> {
             .memory(Memory::Megabyte(effective_ram_mb as u64))
             .profile(Profile::new(name.to_string(), launcherDir.clone().join("instances")));
             
-            // lyceris liest stdout/stderr des Spiels selbst und schickt jede Zeile als
-            // Event::Console an den Emitter. Ohne Emitter (None) geht die Ausgabe verloren.
             let emitter = Emitter::default();
             emitter
                 .on(Event::Console, |line: String| {
                     println!("[MC] {line}");
                 })
                 .await;
-
+            
             if config.loader == "none" {
+                println!("📦 [6/7] Installiere Vanilla Minecraft...");
                 let cfg = builder.build();
-
                 if let Err(e) = install(&cfg, None).await {
-                    println!("Install-Fehler: {:?}", e);
+                    println!("❌ Install-Fehler: {:?}", e);
                     return;
                 }
-                //if let Err(e) = launch(&cfg, None).await {
-                //    println!("Start-Fehler: {:?}", e);
-                //    return;
-                //}
+                
+                println!("▶️  [7/7] Starte Minecraft...");
                 match launch(&cfg, Some(&emitter)).await {
-                    // Wir müssen nur noch auf das Spielende warten, das Log kommt über den Emitter
                     Ok(mut child) => {
                         match child.wait().await {
-                            Ok(status) => println!("Minecraft beendet: {status}"),
-                            Err(e) => println!("Fehler beim Warten auf Minecraft: {e}"),
+                            Ok(status) => println!("✅ Minecraft beendet: {status}"),
+                            Err(e) => println!("❌ Fehler beim Warten auf Minecraft: {e}"),
                         }
                     }
                     Err(e) => {
-                        println!("Start-Fehler: {:?}", e);
+                        println!("❌ Start-Fehler: {:?}", e);
                         return;
                     }
                 }
             } else {
-                // Alte CurseForge-Instanzen haben noch die volle ID im loader-Feld
-                // ("fabric-0.16.9"), deshalb hier immer zerlegen.
                 let (loader_kind, id_version) = split_loader_id(&config.loader);
-
-                // Vorrang: gespeicherte Pack-Version > Version aus der ID > neueste stabile.
+                
+                println!("🔧 [6/7] Bestimme Loader-Version...");
                 let version = match config.loader_version.clone().or(id_version) {
-                    Some(v) => v,
+                    Some(v) => {
+                        println!("   └─ Verwende gespeicherte Version: {}", v);
+                        v
+                    },
                     None => {
+                        println!("   └─ Suche neueste stabile Version für {}...", loader_kind);
                         let Some(v) = latest_loader_version(&loader_kind, &config.minecraft_version).await else {
-                            println!("Loader-Version nicht gefunden");
+                            println!("❌ Loader-Version nicht gefunden");
                             return;
                         };
+                        println!("   └─ Gefunden: {}", v);
                         v
                     }
                 };
-                println!("Nutze {} {}", loader_kind, version);
+                
+                println!("   └─ Nutze {} {}", loader_kind, version);
 
+                let loader_version_str = version.clone();
+                
                 let Some(loader) = make_loader(&loader_kind, version) else {
-                    println!("Unbekannter Loader: {}", loader_kind);
+                    println!("❌ Unbekannter Loader: {}", loader_kind);
                     return;
                 };
-
+                
                 let cfg = builder.loader(loader).build();
-
+                
+                println!("📦 Installiere {} + {}...", config.minecraft_version, loader_kind);
                 if let Err(e) = install(&cfg, None).await {
-                    println!("Install-Fehler: {:?}", e);
-                    return;
-                }
-                //if let Err(e) = launch(&cfg, None).await {
-                //    println!("Start-Fehler: {:?}", e);
-                //    return;
-                //}
+                    println!("⚠️ Install-Fehler: {:?} || Versuche dennoch Fortzufahren", e);
 
+                    // Forge < 1.13 liefert "minecraftArguments" statt "arguments" und bringt lyceris
+                    // beim Parsen zum Absturz. Die Datei liegt jetzt (nach dem Download) im Cache,
+                    // also konvertieren wir sie und versuchen es genau EINMAL erneut.
+                    if loader_kind == "forge" {
+                        println!("🔧 Patche Forge version.json und versuche es erneut...");
+                        patch_forge_version_json(&launcherDir, &config.minecraft_version, &loader_version_str);
+
+                        if let Err(e2) = install(&cfg, None).await {
+                            println!("❌ Install-Fehler nach Patch: {:?}", e2);
+                            return;
+                        }
+                    } else {
+                        return;
+                    }
+                }
+                
+                println!("▶️  [7/7] Starte Minecraft...");
                 match launch(&cfg, Some(&emitter)).await {
-                    // Wir müssen nur noch auf das Spielende warten, das Log kommt über den Emitter
                     Ok(mut child) => {
                         match child.wait().await {
-                            Ok(status) => println!("Minecraft beendet: {status}"),
-                            Err(e) => println!("Fehler beim Warten auf Minecraft: {e}"),
+                            Ok(status) => println!("✅ Minecraft beendet: {status}"),
+                            Err(e) => println!("❌ Fehler beim Warten auf Minecraft: {e}"),
                         }
                     }
                     Err(e) => {
-                        println!("Start-Fehler: {:?}", e);
+                        println!("❌ Start-Fehler: {:?}", e);
                         return;
                     }
                 }
             }
-
+            
+            println!("═══════════════════════════════════════════════════════");
+            println!("🏁 SESSION ENDE");
+            println!("═══════════════════════════════════════════════════════");
+            println!("");
+            
             let _ = ui_handle.upgrade_in_event_loop(|_ui| {
                 println!("Minecraft beendet");
             });
         });
-
-        /*let builded_config = minecraft_config.build();
-        let result = if config.loader == "none" {
-            builded_config = minecraft_config.build();
-        } else {
-            match latest_loader_version(&config.loader, &config.minecraft_version).await
-                .and_then(|v| make_loader(&config.loader, v))
-            {
-                Some(loader) => builded_config.loader(loader).build(),//run(builded_config.loader(loader).build()).await,
-                None => Err("Loader-Version nicht gefunden".to_string()),
-            }
-        };
-
-        //let builded_config = minecraft_config.build();
-
-        handle.spawn(async move {
-            // Testphase: später ersetzt du das durch JSON lesen, Config bauen, install() ...
-            println!("Starte {}", name);
-            //tokio::time::sleep(Duration::from_secs(3)).await;
-
-            install(&builded_config, None).await;
-            launch(&builded_config, None).await;
-
-            let _ = ui_handle.upgrade_in_event_loop(|ui| {
-                println!("Minecraft Gestarted");
-            });
-        });*/
-
     });
 
     // Settings speichern: baut aus den vom Slint-Button mitgegebenen Werten
