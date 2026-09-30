@@ -1,4 +1,4 @@
-import { Button, VerticalBox, GridBox, LineEdit, HorizontalBox, ComboBox, CheckBox, Slider, ScrollView } from "std-widgets.slint";
+import { Button, GridBox, LineEdit, ComboBox, CheckBox, Slider, ScrollView, SpinBox } from "std-widgets.slint";
 
 component ModpackTile inherits Rectangle {
     in property <string> name;
@@ -17,7 +17,7 @@ component ModpackTile inherits Rectangle {
     VerticalLayout {
         spacing: 8px;
         padding: 10px;
-        alignment: center; // Zentriert alle Elemente horizontal
+        alignment: center; //  Zentriert alle Elemente horizontal
 
         // NEU: HorizontalLayout als Wrapper garantiert perfekte Zentrierung des Icons
         HorizontalLayout {
@@ -250,7 +250,8 @@ export component AppWindow inherits Window {
     callback open_instance_details(string); // instance_name -> lädt Mods + Overrides, wechselt Panel
     callback detail_toggle_mod(string, string); // instance_name, filename -> enable/disable
     callback detail_remove_mod(string, string); // instance_name, filename
-    callback detail_save_overrides(string, bool, int, string, string); // instance_name, enabled, ram, java_path, username
+    callback detail_save_overrides(string, bool, int, string, string, int, int, bool); // instance_name, enabled, ram, java_path, username
+    callback detail_open_folder(string); // instance_name -> öffnet den Instanz-Ordner im Dateimanager
     callback detail_add_mod_search(string); // Suchtext im Add-Mod-Popup
     callback detail_add_mod_install(string, string, string); // instance_name, project_id, project_name -> lädt passende Version direkt in mods/
 
@@ -327,6 +328,16 @@ export component AppWindow inherits Window {
 
     // NEU: Aktuelle Quelle im Browser (Standard ist Modrinth)
     in-out property <string> browser_source: "Modrinth";
+
+    // NEU: Für die Dropdowns und erweiterten Settings
+    in property <[string]> available_java_paths;
+    in property <[string]> available_accounts; // z.B. ["Launcher Standard", "Basti (Microsoft)", "TestUser"]
+    in-out property <string> detail_ram_unit: "GB"; // "MB" oder "GB"
+    in-out property <string> detail_java_selection: "Launcher Standard";
+    in-out property <string> detail_account_selection: "Launcher Standard";
+    in-out property <int> detail_window_width: 854;
+    in-out property <int> detail_window_height: 480;
+    in-out property <bool> detail_fullscreen: false;
 
     // Global Style
     background: #313e50;
@@ -567,9 +578,9 @@ export component AppWindow inherits Window {
                         spacing: 10px;
                         max-height: 30px;
                         Text { text: "Java-Pfad"; color: white; vertical-alignment: center; width: 180px; }
-                        java_path_box := LineEdit {
-                            placeholder-text: "Automatisch erkannt";
-                            text: root.java_path;
+                        ComboBox {
+                            model: root.available_java_paths;
+                            current-value <=> root.detail_java_selection;
                         }
                     }
 
@@ -602,14 +613,15 @@ export component AppWindow inherits Window {
 
                     Rectangle { vertical-stretch: 1; }
 
-                    Button {
+                                        Button {
                         text: "Speichern";
                         primary: true;
                         width: 120px;
                         clicked => {
                             // Werte erst lokal in die properties übernehmen, dann Callback feuern
                             root.default_ram_mb = round(ram_slider.value);
-                            root.java_path = java_path_box.text;
+                            // root.java_path wird bereits live durch die ComboBox aktualisiert, 
+                            // wir müssen es hier nicht mehr aus einem Textfeld lesen!
                             root.default_username = username_box.text;
                             root.close_after_launch = close_after_launch_box.checked;
                             root.open_on_startup = open_on_startup_box.checked;
@@ -717,7 +729,6 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         max-height: 30px;
                         spacing: 10px;
-
                         Button {
                             text: "< Zurück";
                             width: 90px;
@@ -734,9 +745,11 @@ export component AppWindow inherits Window {
                     }
 
                     Text { text: "Mods"; font-size: 16px; font-weight: 700; color: white; }
-
                     HorizontalLayout {
                         max-height: 30px;
+                        spacing: 10px;
+                        alignment: start; // Buttons behalten ihre feste Breite und stehen links nebeneinander
+
                         Button {
                             text: "+ Mod hinzufügen";
                             width: 160px;
@@ -746,29 +759,28 @@ export component AppWindow inherits Window {
                                 root.detail_add_mod_search("");
                             }
                         }
+                        Button {
+                            text: "Im Ordner öffnen";
+                            width: 160px;
+                            clicked => { root.detail_open_folder(root.detail_instance_name) }
+                        }
                     }
 
-                    // Liste der Mods im mods-Ordner dieser Instanz, jetzt scrollbar.
-                    // vertical-stretch: 1 gibt der Liste den ganzen freien Platz zwischen Header und
-                    // Overrides-Bereich; bei vielen Mods scrollt sie, statt alles nach unten zu drücken.
                     mods_scroll := ScrollView {
                         vertical-stretch: 1;
-
                         VerticalLayout {
-                            alignment: start; // Zeilen bleiben oben, auch wenn die Liste kurz ist
+                            alignment: start;
                             spacing: 4px;
-
                             for mod_file in root.detail_mod_files : HorizontalLayout {
                                 max-height: 26px;
                                 spacing: 10px;
-
                                 Image { source: mod_file.icon; width: 20px; height: 20px; }
                                 Text {
                                     text: mod_file.display_name;
-                                    color: mod_file.enabled ? white : #7a8291; // deaktivierte Mods gedimmt
+                                    color: mod_file.enabled ? white : #7a8291;
                                     vertical-alignment: center;
                                     horizontal-stretch: 1;
-                                    overflow: elide; // lange Dateinamen werden mit "..." gekürzt, die Buttons bleiben sichtbar
+                                    overflow: elide;
                                 }
                                 Button {
                                     text: mod_file.enabled ? "Deaktivieren" : "Aktivieren";
@@ -786,78 +798,118 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    Rectangle { height: 10px; } // Trenner-Abstand
-
-                    Text { text: "Einstellungen für diese Instanz"; font-size: 16px; font-weight: 700; color: white; }
+                    Rectangle { height: 10px; }
+                    Text { text: "Erweiterte Einstellungen für diese Instanz"; font-size: 16px; font-weight: 700; color: white; }
 
                     detail_overrides_box := CheckBox {
-                        text: "Eigene Einstellungen für diese Instanz verwenden (statt globaler Settings)";
-                        checked: root.detail_overrides_enabled;
+                        text: "Globale Einstellungen für diese Instanz überschreiben";
+                        checked <=> root.detail_overrides_enabled; // Zwei-Wege: Klick ändert die Property, Rust-Setter ändert die Checkbox
                     }
 
-                    VerticalLayout {
-                        spacing: 10px;
+                    ScrollView {
+                        vertical-stretch: 1;
                         visible: detail_overrides_box.checked;
+                        
+                        Rectangle {
+                            background: #232c3a;
+                            border-radius: 6px;
+                            
+                            VerticalLayout {
+                                spacing: 12px;
+                                padding: 10px;
 
-                        HorizontalLayout {
-                            spacing: 10px;
-                            max-height: 30px;
-                            Text { text: "RAM (MB)"; color: white; vertical-alignment: center; width: 180px; }
-                            detail_ram_slider := Slider {
-                                minimum: 1024;
-                                maximum: 16384;
-                                value: root.detail_ram_mb;
-                            }
-                            Text { text: round(detail_ram_slider.value) + " MB"; color: white; vertical-alignment: center; width: 80px; }
-                        }
+                                // 1. RAM (Slider + MB/GB Toggle)
+                                Text { text: "Zugewiesener Arbeitsspeicher"; font-size: 14px; font-weight: 700; color: #a0a8b5; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    detail_ram_slider := Slider {
+                                        minimum: 1;
+                                        maximum: 32;
+                                        value: root.detail_ram_mb / 1024; 
+                                        horizontal-stretch: 1;
+                                    }
+                                    ComboBox {
+                                        width: 80px;
+                                        model: ["MB", "GB"];
+                                        current-value <=> root.detail_ram_unit; // Automatische Zwei-Wege-Bindung
+                                        //activated(index) => { root.detail_ram_unit = self.model[index]; }
+                                    }
+                                    Text {
+                                        width: 80px;
+                                        text: root.detail_ram_unit == "GB" 
+                                              ? round(detail_ram_slider.value) + " GB" 
+                                              : round(detail_ram_slider.value * 1024) + " MB";
+                                        color: white;
+                                        vertical-alignment: center;
+                                        font-weight: 700;
+                                    }
+                                }
 
-                        HorizontalLayout {
-                            spacing: 10px;
-                            max-height: 30px;
-                            Text { text: "Java-Pfad"; color: white; vertical-alignment: center; width: 180px; }
-                            detail_java_path_box := LineEdit {
-                                placeholder-text: "Automatisch erkannt";
-                                text: root.detail_java_path;
-                            }
-                        }
+                                // 2. Java Pfad Dropdown
+                                Text { text: "Java Ausführungspfad"; font-size: 14px; font-weight: 700; color: #a0a8b5; }
+                                ComboBox {
+                                    model: root.available_java_paths;
+                                    current-value <=> root.detail_java_selection; // Automatische Zwei-Wege-Bindung
+                                }
 
-                        HorizontalLayout {
-                            spacing: 10px;
-                            max-height: 30px;
-                            Text { text: "Nutzername"; color: white; vertical-alignment: center; width: 180px; }
-                            detail_username_box := LineEdit {
-                                placeholder-text: "TestUser";
-                                text: root.detail_username;
-                            }
-                        }
-                    }
+                                // 3. Account Auswahl Dropdown
+                                Text { text: "Benutzerkonto für diese Instanz"; font-size: 14px; font-weight: 700; color: #a0a8b5; }
+                                ComboBox {
+                                    model: root.available_accounts;
+                                    current-value <=> root.detail_account_selection;
+                                }
+
+                                // 4. Fenstergröße
+                                Text { text: "Fenstergröße"; font-size: 14px; font-weight: 700; color: #a0a8b5; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Text { text: "Breite:"; color: white; vertical-alignment: center; width: 60px; }
+                                    SpinBox {
+                                        value <=> root.detail_window_width; // Automatische Zwei-Wege-Bindung
+                                        width: 80px;
+                                        minimum: 640;
+                                        maximum: 3840;
+                                    }
+                                    Text { text: "Höhe:"; color: white; vertical-alignment: center; width: 60px; }
+                                    SpinBox {
+                                        value <=> root.detail_window_height; // Automatische Zwei-Wege-Bindung
+                                        width: 80px;
+                                        minimum: 480;
+                                        maximum: 2160;
+                                    }
+                                    CheckBox { 
+                                        text: "Vollbild"; 
+                                        checked <=> root.detail_fullscreen;
+                                    }
+                                }
+                            } // <--- Schließt VerticalLayout
+                        } // <--- Schließt Rectangle (das fehlte!)
+                    } // <--- Schließt ScrollView (das fehlte!)
 
                     Rectangle { vertical-stretch: 1; }
 
                     Button {
-                        text: "Overrides speichern";
+                        text: "Einstellungen speichern";
                         primary: true;
-                        width: 160px;
+                        width: 100%;
                         clicked => {
-                            root.detail_overrides_enabled = detail_overrides_box.checked;
-                            root.detail_ram_mb = round(detail_ram_slider.value);
-                            root.detail_java_path = detail_java_path_box.text;
-                            root.detail_username = detail_username_box.text;
-
+                            let final_ram_mb = round(detail_ram_slider.value * 1024);
                             root.detail_save_overrides(
                                 root.detail_instance_name,
                                 root.detail_overrides_enabled,
-                                root.detail_ram_mb,
-                                root.detail_java_path,
-                                root.detail_username,
+                                final_ram_mb,
+                                root.detail_java_selection,
+                                root.detail_account_selection,
+                                root.detail_window_width,
+                                root.detail_window_height,
+                                root.detail_fullscreen
                             );
                         }
                     }
-                }
+                } // <--- Schließt den gesamten Instance Detail Block
             }
         }
     }
-
     running_bar := RunningBar {
         y: parent.height - self.height; // klebt am unteren Rand, wächst nach oben
         width: 100%;

@@ -99,8 +99,11 @@ impl Default for LauncherSettings {
 struct InstanceOverrides {
     enabled: bool,
     ram_mb: i32,
-    java_path: String,
-    username: String,
+    java_path: String,       // "Launcher Standard" oder konkreter Pfad
+    account_id: String,      // "Launcher Standard" oder die ID des Accounts
+    window_width: i32,
+    window_height: i32,
+    fullscreen: bool,
 }
 
 impl Default for InstanceOverrides {
@@ -108,8 +111,11 @@ impl Default for InstanceOverrides {
         Self {
             enabled: false,
             ram_mb: 2048,
-            java_path: String::new(),
-            username: "TestUser".to_string(),
+            java_path: "Launcher Standard".to_string(),
+            account_id: "Launcher Standard".to_string(),
+            window_width: 854,
+            window_height: 480,
+            fullscreen: false,
         }
     }
 }
@@ -375,6 +381,15 @@ fn extract_modrinth_project_id(url: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn get_available_java_paths() -> Vec<String> {
+    let mut paths = vec!["Launcher Standard".to_string()];
+    // Füge hier bekannte Pfade hinzu, falls vorhanden
+    if std::path::Path::new("/usr/bin/java").exists() {
+        paths.push("/usr/bin/java".to_string());
+    }
+    paths
 }
 
 // Gemeinsamer HTTP-Client mit ordentlichem User-Agent (Modrinth bittet in
@@ -1519,6 +1534,23 @@ fn open_in_browser(url: &str) {
     }
 }
 
+// Öffnet einen Ordner im Dateimanager des Systems (gleiches Prinzip wie open_in_browser).
+// spawn() wartet nicht auf den Dateimanager, der Launcher bleibt also bedienbar.
+fn open_in_file_manager(path: &Path) {
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("explorer").arg(path).spawn();
+
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(path).spawn();
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open").arg(path).spawn();
+
+    if let Err(e) = result {
+        println!("Konnte Ordner nicht öffnen: {e}");
+    }
+}
+
 // Holt den Auth-Code aus dem, was der Nutzer eingefügt hat: entweder die komplette Adresse der
 // leeren Seite (".../oauth20_desktop.srf?code=XYZ&lc=1031") oder nur der Code selbst.
 fn extract_auth_code(input: &str) -> Option<String> {
@@ -2236,34 +2268,37 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("⚙️  [2/7] Lade Instanz-Overrides...");
         let overrides = load_instance_overrides(&instance_dir);
         if overrides.enabled {
-            println!("   └─ Overrides aktiviert (RAM: {} MB, Username: {})", overrides.ram_mb, overrides.username);
+            // FIX 1: overrides.username durch overrides.account_id ersetzt
+            println!("   └─ Overrides aktiviert (RAM: {} MB, Account: {})", overrides.ram_mb, overrides.account_id);
         } else {
             println!("   └─ Overrides deaktiviert, nutze globale Settings");
         }
-        
+
         println!("💾 [3/7] Berechne effektiven RAM...");
         let settings = load_settings(&launcherDir);
         let effective_ram_mb = if overrides.enabled { overrides.ram_mb } else { settings.default_ram_mb };
         println!("   └─ Effektiver RAM: {} MB", effective_ram_mb);
-        
+
         println!("👤 [4/7] Bestimme Authentifizierung...");
+        // FIX 2: Die Accounts müssen hier explizit geladen werden, bevor wir sie nutzen!
         let accounts = load_accounts(&launcherDir);
-        let selected_account: Option<AccountEntry> = accounts
-            .selected_id
-            .as_ref()
-            .and_then(|id| accounts.accounts.iter().find(|a| &a.id == id))
-            .cloned();
-        
-        let override_username: Option<String> = if overrides.enabled { Some(overrides.username.clone()) } else { None };
-        
-        let auth_type = if override_username.is_some() {
-            "Offline (Override)"
+
+        // Account auswählen: Override hat Vorrang, sonst globaler Account
+        let selected_account: Option<AccountEntry> = if overrides.enabled && overrides.account_id != "Launcher Standard" {
+            accounts.accounts.iter().find(|a| {
+                let kind_str = if a.kind == "microsoft" { " (Microsoft)" } else { " (Offline)" };
+                format!("{}{}", a.username, kind_str) == overrides.account_id
+            }).cloned()
         } else {
-            match &selected_account {
-                Some(acc) if acc.kind == "microsoft" => "Microsoft",
-                Some(acc) => "Offline",
-                None => "Offline (Fallback: TestUser)",
-            }
+            accounts.selected_id.as_ref()
+                .and_then(|id| accounts.accounts.iter().find(|a| &a.id == id))
+                .cloned()
+        };
+
+        let auth_type = match &selected_account {
+            Some(acc) if acc.kind == "microsoft" => "Microsoft",
+            Some(acc) => "Offline",
+            None => "Offline (Fallback: TestUser)",
         };
         println!("   └─ Auth-Typ: {}", auth_type);
         
@@ -2278,21 +2313,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("🚀 [5/7] Starte Installation/Setup...");
             
             // Auth bestimmen
-            let auth = if let Some(name) = override_username {
-                lyceris::AuthMethod::Offline { username: name, uuid: None }
-            } else {
-                match selected_account {
-                    Some(acc) if acc.kind == "microsoft" => match microsoft_auth_for(&launcherDir, acc).await {
-                        Ok(auth) => auth,
-                        Err(e) => {
-                            println!("❌ Microsoft-Anmeldung fehlgeschlagen: {e}");
-                            push_debug_log(&ui_handle, format!("Microsoft-Anmeldung fehlgeschlagen: {e}"));
-                            return;
-                        }
-                    },
-                    Some(acc) => lyceris::AuthMethod::Offline { username: acc.username, uuid: None },
-                    None => lyceris::AuthMethod::Offline { username: "TestUser".to_string(), uuid: None },
-                }
+            let auth = match selected_account {
+                Some(acc) if acc.kind == "microsoft" => match microsoft_auth_for(&launcherDir, acc).await {
+                    Ok(auth) => auth,
+                    Err(e) => {
+                        println!("❌ Microsoft-Anmeldung fehlgeschlagen: {e}");
+                        push_debug_log(&ui_handle, format!("Microsoft-Anmeldung fehlgeschlagen: {e}"));
+                        return;
+                    }
+                },
+                Some(acc) => lyceris::AuthMethod::Offline { username: acc.username, uuid: None },
+                None => lyceris::AuthMethod::Offline { username: "TestUser".to_string(), uuid: None },
             };
             
             let builder = ConfigBuilder::new(
@@ -3179,10 +3210,43 @@ fn main() -> Result<(), Box<dyn Error>> {
         ui.set_detail_mod_files(ModelRc::new(VecModel::from(
             mods_raw.iter().cloned().map(build_mod_file_info).collect::<Vec<_>>(),
         )));
+
+        // NEU: Dropdowns und erweiterte Settings befüllen
         ui.set_detail_overrides_enabled(overrides.enabled);
         ui.set_detail_ram_mb(overrides.ram_mb);
-        ui.set_detail_java_path(overrides.java_path.into());
-        ui.set_detail_username(overrides.username.into());
+
+        // Setze die Auswahl im Dropdown. Falls der gespeicherte Pfad nicht mehr in der Liste ist, fallback auf Standard.
+        let java_paths_str = get_available_java_paths();
+        let java_paths: Vec<SharedString> = java_paths_str.iter().map(|s| SharedString::from(s.clone())).collect();
+        let java_sel = if java_paths_str.contains(&overrides.java_path) {
+            SharedString::from(overrides.java_path)
+        } else {
+            SharedString::from("Launcher Standard")
+        };
+        ui.set_available_java_paths(ModelRc::new(VecModel::from(java_paths)));
+        ui.set_detail_java_selection(java_sel);
+
+        // Accounts für Dropdown zusammenbauen
+        let accounts_data = load_accounts(&launcherDir);
+        let mut acc_options_str = vec!["Launcher Standard".to_string()];
+        for acc in &accounts_data.accounts {
+            let kind_str = if acc.kind == "microsoft" { " (Microsoft)" } else { " (Offline)" };
+            acc_options_str.push(format!("{}{}", acc.username, kind_str));
+        }
+        let acc_options: Vec<SharedString> = acc_options_str.iter().map(|s| SharedString::from(s.clone())).collect();
+
+        let acc_sel = if overrides.account_id == "Launcher Standard" || acc_options_str.iter().any(|a| a.contains(&overrides.account_id)) {
+            SharedString::from(overrides.account_id)
+        } else {
+            SharedString::from("Launcher Standard")
+        };
+        ui.set_available_accounts(ModelRc::new(VecModel::from(acc_options)));
+        ui.set_detail_account_selection(acc_sel);
+
+        // Fenster-Einstellungen
+        ui.set_detail_window_width(overrides.window_width);
+        ui.set_detail_window_height(overrides.window_height);
+        ui.set_detail_fullscreen(overrides.fullscreen);
         ui.set_selected_panel("Instance Detail".into());
 
         println!("📂 Detailansicht für '{}' geöffnet. Prüfe auf fehlende Icons...", name);
@@ -3305,24 +3369,39 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     // Instanz-eigene Overrides speichern (instance_overrides.json).
-    ui.on_detail_save_overrides(move |instance_name, enabled, ram, java_path, username| {
-        let _ui = save_overrides_ui_handle.unwrap();
+    ui.on_detail_save_overrides(move |instance_name, enabled, ram_mb, java_path, account_id, win_w, win_h, fullscreen| {
+        let launcherDir = dirs::data_local_dir().expect("kein Local Data Dir").join("srusm");
+        let instance_dir = launcherDir.join("instances").join(instance_name.to_string());
+        
+        // Lade bestehende Overrides (falls vorhanden)
+        let mut overrides = load_instance_overrides(&instance_dir);
+        
+        // Aktualisiere nur die Werte, die wir übergeben bekommen
+        overrides.enabled = enabled;
+        overrides.ram_mb = ram_mb;
+        overrides.java_path = java_path.to_string();
+        overrides.account_id = account_id.to_string();
+        overrides.window_width = win_w;
+        overrides.window_height = win_h;
+        overrides.fullscreen = fullscreen;
+        
+        save_instance_overrides(&instance_dir, &overrides);
+        println!("✅ Overrides für '{}' gespeichert.", instance_name);
+    });
 
+    // Instanz-Ordner im Dateimanager öffnen. Das ist der gameDir der Instanz, dort liegen
+    // mods/, config/, saves/ usw. Es braucht keinen UI-Handle, weil wir nichts in die UI schreiben.
+    ui.on_detail_open_folder(move |instance_name| {
         let launcherDir = dirs::data_local_dir()
             .expect("kein Local Data Dir")
             .join("srusm");
         let instance_dir = launcherDir.join("instances").join(instance_name.to_string());
 
-        let overrides = InstanceOverrides {
-            enabled,
-            ram_mb: ram,
-            java_path: java_path.to_string(),
-            username: username.to_string(),
-        };
-
-        save_instance_overrides(&instance_dir, &overrides);
-
-        println!("Overrides für {} gespeichert: {:?}", instance_name, overrides);
+        if instance_dir.is_dir() {
+            open_in_file_manager(&instance_dir);
+        } else {
+            println!("Instanz-Ordner nicht gefunden: {}", instance_dir.display());
+        }
     });
 
     // Add-Mod-Popup Suche: identisch zur Modpack-Suche, nur project_type "mod"
