@@ -1718,6 +1718,67 @@ fn patch_forge_version_json(launcher_dir: &Path, mc_version: &str, loader_versio
     }
 }
 
+// Ergänzt in der Start-JSON (shared/versions/<mc>-<forge>/<mc>-<forge>.json) die "--tweakClass"-Argumente
+// aus dem Forge-Profil. Lyceris übernimmt bei altem Forge (<= 1.12.2) nur mainClass und Bibliotheken,
+// aber nicht die Startargumente. Ohne FMLTweaker startet stattdessen der VanillaTweaker und das Spiel
+// findet die (obfuskierten) Minecraft-Klassen nicht.
+// Ist idempotent: steht "--tweakClass" schon drin, passiert nichts. Bei modernem Forge
+// (JSON mit "arguments" statt "minecraftArguments") tut die Funktion ebenfalls nichts.
+fn patch_forge_launch_args(launcher_dir: &Path, mc_version: &str, loader_version: &str) {
+    let id = format!("{}-{}", mc_version, loader_version);
+
+    let profile_path = launcher_dir
+        .join("shared/.forge/profiles")
+        .join(&id)
+        .join(format!("version-{}.json", id));
+    let target_path = launcher_dir
+        .join("shared/versions")
+        .join(&id)
+        .join(format!("{}.json", id));
+
+    // 1. Tweak-Argumente aus dem Forge-Profil holen (Original-Feld minecraftArguments)
+    let Ok(profile_str) = fs::read_to_string(&profile_path) else {
+        println!("⚠️ Forge-Profil nicht gefunden: {}", profile_path.display());
+        return;
+    };
+    let Ok(profile_json) = serde_json::from_str::<serde_json::Value>(&profile_str) else { return; };
+    let Some(forge_args) = profile_json.get("minecraftArguments").and_then(|v| v.as_str()) else { return; };
+
+    // Alle Paare "--tweakClass <Klasse>" einsammeln
+    let tokens: Vec<&str> = forge_args.split_whitespace().collect();
+    let mut extra: Vec<String> = Vec::new();
+    for i in 0..tokens.len().saturating_sub(1) {
+        if tokens[i] == "--tweakClass" {
+            extra.push(format!("--tweakClass {}", tokens[i + 1]));
+        }
+    }
+    if extra.is_empty() { return; }
+
+    // 2. In die Start-JSON einfügen
+    let Ok(target_str) = fs::read_to_string(&target_path) else {
+        println!("⚠️ Start-JSON nicht gefunden: {}", target_path.display());
+        return;
+    };
+    let Ok(mut target_json) = serde_json::from_str::<serde_json::Value>(&target_str) else { return; };
+
+    let Some(current) = target_json.get("minecraftArguments").and_then(|v| v.as_str()).map(|s| s.to_string()) else {
+        return; // kein minecraftArguments -> modernes Format, hier nichts zu tun
+    };
+    if current.contains("--tweakClass") {
+        return; // schon gepatcht
+    }
+
+    target_json["minecraftArguments"] = serde_json::Value::String(format!("{} {}", current, extra.join(" ")));
+
+    match serde_json::to_string(&target_json) {
+        Ok(new_content) => match fs::write(&target_path, new_content) {
+            Ok(_) => println!("✅ Forge-Tweaker in Start-JSON ergänzt: {}", extra.join(" ")),
+            Err(e) => println!("⚠️ Konnte Start-JSON nicht schreiben: {}", e),
+        },
+        Err(e) => println!("⚠️ Konnte Start-JSON nicht serialisieren: {}", e),
+    }
+}
+
 async fn install_cf_modpack(
     instance_dir: &PathBuf,
     zip_bytes: Vec<u8>,
@@ -1839,6 +1900,53 @@ fn find_system_glfw() -> Option<&'static str> {
     CANDIDATES.iter().copied().find(|p| Path::new(p).exists())
 }
 
+// Laufende Instanzen: Instanzname -> Sender, mit dem wir dem Warte-Task "kill!" zurufen.
+// Arc<Mutex<..>>, weil UI-Callbacks und Tokio-Tasks darauf zugreifen.
+type RunningMap = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>;
+
+// Baut die Liste für die untere Leiste neu auf. Läuft über den Event-Loop, weil
+// Slint-Modelle nur im UI-Thread angefasst werden dürfen.
+fn refresh_running_ui(ui_handle: &Weak<AppWindow>, running: &RunningMap) {
+    let mut names: Vec<String> = running.lock().unwrap().keys().cloned().collect();
+    names.sort();
+    let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+        let items: Vec<RunningInstance> = names
+            .into_iter()
+            .map(|n| RunningInstance { name: n.into() })
+            .collect();
+        ui.set_running_instances(ModelRc::new(VecModel::from(items)));
+    });
+}
+
+// Trägt den gestarteten Prozess in die Liste ein und wartet, bis er endet ODER
+// "Force Stop" gedrückt wird. Danach wird er wieder ausgetragen.
+async fn run_and_track(
+    mut child: tokio::process::Child,
+    name: String,
+    running: RunningMap,
+    ui_handle: Weak<AppWindow>,
+) {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    running.lock().unwrap().insert(name.clone(), tx);
+    refresh_running_ui(&ui_handle, &running);
+
+    tokio::select! {
+        // Spiel wurde normal beendet
+        result = child.wait() => match result {
+            Ok(status) => println!("✅ Minecraft beendet: {status}"),
+            Err(e) => println!("❌ Fehler beim Warten auf Minecraft: {e}"),
+        },
+        // Force Stop: Ok(()) = rx matcht nur, wenn wirklich gesendet wurde
+        Ok(()) = rx => {
+            println!("🛑 Force Stop: {name}");
+            let _ = child.kill().await; // SIGKILL und wartet, bis der Prozess weg ist
+        }
+    }
+
+    running.lock().unwrap().remove(&name);
+    refresh_running_ui(&ui_handle, &running);
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
 
     // NVIDIA-Workaround: wird an den Minecraft-Prozess vererbt.
@@ -1924,6 +2032,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     let pending_resolution_install = pending_resolution.clone();
     let pending_resolution_apply = pending_resolution.clone();
     let pending_resolution_disable = pending_resolution.clone();
+
+    // Laufende Instanzen + die Klone für die beiden Closures, die sie brauchen
+    let running: RunningMap = Arc::new(Mutex::new(HashMap::new()));
+    let running_play = running.clone();
+    let running_stop = running.clone();
+    ui.set_running_instances(ModelRc::new(VecModel::from(Vec::<RunningInstance>::new())));
+
+    // Force Stop: Sender aus der Map nehmen und feuern -> der wartende Task killt den Prozess.
+    // Das Austragen aus der Liste übernimmt run_and_track danach selbst.
+    ui.on_force_stop(move |name| {
+        if let Some(tx) = running_stop.lock().unwrap().remove(name.as_str()) {
+            let _ = tx.send(());
+        }
+    });
 
     // Program Local Dir Setup
     let launcherDir = dirs::data_local_dir()
@@ -2149,6 +2271,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         let ui_handle = ui_handle.clone();
         let handle = handle.clone();
         let name = name.to_string();
+
+        let running = running_play.clone(); // wandert in den async-Block
         
         handle.spawn(async move {
             println!("🚀 [5/7] Starte Installation/Setup...");
@@ -2196,12 +2320,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 
                 println!("▶️  [7/7] Starte Minecraft...");
                 match launch(&cfg, Some(&emitter)).await {
-                    Ok(mut child) => {
-                        match child.wait().await {
-                            Ok(status) => println!("✅ Minecraft beendet: {status}"),
-                            Err(e) => println!("❌ Fehler beim Warten auf Minecraft: {e}"),
-                        }
-                    }
+                    // Prozess läuft: in die Leiste eintragen und warten (oder killen)
+                    Ok(child) => run_and_track(child, name.clone(), running.clone(), ui_handle.clone()).await,
                     Err(e) => {
                         println!("❌ Start-Fehler: {:?}", e);
                         return;
@@ -2257,15 +2377,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                         return;
                     }
                 }
+
+                // Forge <= 1.12.2: Tweaker-Argumente in die Start-JSON schreiben (siehe Funktion).
+                // Bei jedem Start, weil install() die Datei neu schreiben kann.
+                if loader_kind == "forge" {
+                    patch_forge_launch_args(&launcherDir, &config.minecraft_version, &loader_version_str);
+                }
                 
                 println!("▶️  [7/7] Starte Minecraft...");
                 match launch(&cfg, Some(&emitter)).await {
-                    Ok(mut child) => {
-                        match child.wait().await {
-                            Ok(status) => println!("✅ Minecraft beendet: {status}"),
-                            Err(e) => println!("❌ Fehler beim Warten auf Minecraft: {e}"),
-                        }
-                    }
+                    // Prozess läuft: in die Leiste eintragen und warten (oder killen)
+                    Ok(child) => run_and_track(child, name.clone(), running.clone(), ui_handle.clone()).await,
                     Err(e) => {
                         println!("❌ Start-Fehler: {:?}", e);
                         return;
