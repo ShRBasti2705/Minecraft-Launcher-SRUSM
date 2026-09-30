@@ -1,20 +1,15 @@
 import { Button, VerticalBox, GridBox, LineEdit, HorizontalBox, ComboBox, CheckBox, Slider, ScrollView } from "std-widgets.slint";
 
 component ModpackTile inherits Rectangle {
-    
     in property <string> name;
     in property <image> icon;
 
-    min-width: 100px;
-    min-height: 170px;
-    //max-width: 100px;
-    max-height: 170px;
+    width: 120px;
+    height: 170px;
 
     callback modpack_play(string);
-    callback modpack_details(string); // Klick irgendwo im Tile außer Play -> Detailansicht
+    callback modpack_details(string);
 
-    // Liegt HINTER dem restlichen Inhalt, fängt also nur Klicks ab, die nicht
-    // vom Play-Button (der danach kommt und somit obenauf liegt) geschluckt werden.
     TouchArea {
         clicked => { root.modpack_details(root.name) }
     }
@@ -22,16 +17,31 @@ component ModpackTile inherits Rectangle {
     VerticalLayout {
         spacing: 8px;
         padding: 10px;
+        alignment: center; // Zentriert alle Elemente horizontal
 
+        // NEU: HorizontalLayout als Wrapper garantiert perfekte Zentrierung des Icons
         HorizontalLayout {
             alignment: center;
-            Image { source: root.icon; width: 40px; height: 40px; }
+            Image { source: root.icon; width: 48px; height: 48px; }
         }
-        Text { text: name; height: 20px; horizontal-alignment: center; color: white; wrap: word-wrap; }
-        Button { text: "Play"; height: 40px; primary: true; clicked => {modpack_play(name)} }
+        
+        Text { 
+            text: name; 
+            horizontal-alignment: center; 
+            color: white; 
+            wrap: word-wrap;
+            overflow: elide; // Schneidet mit "..." ab, wenn der Name zu lang ist
+            height: 32px;    // Reserviert Platz für maximal 2 Zeilen
+        }
+        
+        Button { 
+            text: "Play"; 
+            width: 100%;     // Füllt die Breite aus
+            height: 36px; 
+            primary: true; 
+            clicked => { modpack_play(name) } 
+        }
     }
-    
-    
 }
 
 struct BrowserPackInfo { project_id: string, name: string, summary: string, author: string, icon: image, source: string }
@@ -45,12 +55,10 @@ component BrowserTile inherits Rectangle {
     in property <image> icon;
     in property <string> source;
 
-    callback install_clicked(string, string, string); // project_id, name, source
+    callback install_clicked(string, string, string);
 
-    min-width: 220px;
-    min-height: 110px;
-    //max-width: 220px;
-    max-height: 110px;
+    width: 260px;
+    height: 120px;
     background: #2c3747;
     border-radius: 6px;
 
@@ -59,7 +67,7 @@ component BrowserTile inherits Rectangle {
         y: 4px;
         width: 68px;
         height: 16px;
-        background: root.source == "CurseForge" ? #f16436 : #1bd96a; // Orange für CF, Grün für Modrinth
+        background: root.source == "CurseForge" ? #f16436 : #1bd96a;
         border-radius: 4px;
         Text {
             text: root.source;
@@ -72,19 +80,50 @@ component BrowserTile inherits Rectangle {
     }
 
     VerticalLayout {
-        spacing: 6px;
+        spacing: 4px;
         padding: 12px;
+        height: 100%; 
 
+        // 1. Name und Icon (oben)
         HorizontalLayout {
             spacing: 8px;
             Image { source: root.icon; width: 28px; height: 28px; }
-            Text { text: name; font-size: 16px; font-weight: 700; color: white; vertical-alignment: center; }
+            Text { 
+                text: name; 
+                font-size: 14px; 
+                font-weight: 700; 
+                color: white; 
+                vertical-alignment: center;
+                overflow: elide; 
+                horizontal-stretch: 1; 
+            }
         }
-        Text { text: summary; font-size: 11px; color: #a0a8b5; wrap: word-wrap; }
+        
+        // 2. Description (Mitte) - FESTE HÖHE, um Overlap zu verhindern
+        Text { 
+            text: summary; 
+            font-size: 11px; 
+            color: #a0a8b5; 
+            wrap: word-wrap;
+            overflow: elide; 
+            height: 36px; // <-- NEU: Begrenzt auf ca. 2-3 Zeilen, verhindert Overlap garantiert
+        }
+        
+        // 3. Author und Install Button (unten, fest verankert)
         HorizontalLayout {
-            Text { text: "by " + author; font-size: 10px; color: #7a8291; }
-            Rectangle { horizontal-stretch: 1; }
-            Button { text: "Install"; height: 22px; clicked => { root.install_clicked(root.project_id, root.name, root.source) } } // Bei BrowserTile-Nutzung im Add-Mod-Popup zeigt der Button "Install", fügt dort aber direkt zur Instanz hinzu
+            spacing: 4px;
+            Text { 
+                text: "by " + author; 
+                font-size: 10px; 
+                color: #7a8291; 
+                overflow: elide; 
+                horizontal-stretch: 1; 
+            }
+            Button { 
+                text: "Install"; 
+                height: 22px; 
+                clicked => { root.install_clicked(root.project_id, root.name, root.source) } 
+            }
         }
     }
 }
@@ -309,7 +348,7 @@ export component AppWindow inherits Window {
 
                     instances_scroll := ScrollView {
                         vertical-stretch: 1;
-                        property <int> cols: max(1, floor(((self.width / 1px) - 36) / 120));
+                        property <int> cols: max(1, floor(((self.width / 1px) - 20) / 140)); // 120px Breite + 20px Spacing
 
                         GridLayout {
                             spacing: 20px;
@@ -366,7 +405,7 @@ export component AppWindow inherits Window {
 
                     browser_scroll := ScrollView {
                         vertical-stretch: 1;
-                        property <int> cols: max(1, floor(((self.width / 1px) - 16) / 236)); // 220 Kachel + 16 Spacing
+                        property <int> cols: max(1, floor(((self.width / 1px) - 16) / 276)); // 260px Breite + 16px Spacing
 
                         GridLayout {
                             spacing: 16px;

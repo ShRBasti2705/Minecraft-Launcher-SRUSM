@@ -157,6 +157,12 @@ const CF_API_KEY: &str = "$2a$10$bL4bIL5pUWqfcO7KQtnMReakwtfHbNKh6v1uTpKlzhwoueE
 #[derive(Deserialize)]
 struct CfLogo { thumbnailUrl: String }
 
+// NEU: Hilfs-Struct für die Autoren-Liste von CurseForge
+#[derive(Deserialize)]
+struct CfAuthor {
+    name: String,
+}
+
 #[derive(Deserialize)]
 struct CfSearchHit {
     id: i64,
@@ -164,7 +170,7 @@ struct CfSearchHit {
     #[serde(default)]
     summary: String,
     #[serde(default)]
-    author: String,
+    authors: Vec<CfAuthor>, // <-- GEÄNDERT: CurseForge liefert ein Array von Autoren
     #[serde(default)]
     logo: Option<CfLogo>,
 }
@@ -296,6 +302,7 @@ struct MrpackIndex {
 // Plain-Data-Variante der Mod-Zeilen für die Detailansicht (Send-sicher, ohne
 // slint::Image). Das eigentliche ModFileInfo (mit geladenem Icon) wird erst
 // auf dem UI-Thread daraus gebaut, siehe build_mod_file_info.
+#[derive(Clone)] // <-- NEU: Damit wir .clone() und .cloned() verwenden können
 struct ModFileEntry {
     filename: String,
     display_name: String,
@@ -335,6 +342,39 @@ fn save_mod_meta(instance_dir: &Path, meta: &[ModEntryMeta]) {
             println!("Konnte mod_meta.json nicht speichern: {e}");
         }
     }
+}
+
+// NEU: Eintrag für die zentrale mods-list.json
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ModListEntry {
+    filename: String,      // z.B. "sodium.jar"
+    project_id: String,    // z.B. "AANobbMI" oder "282963"
+}
+
+fn save_mods_list(instance_dir: &Path, list: &[ModListEntry]) {
+    if let Ok(json) = serde_json::to_string_pretty(list) {
+        if let Err(e) = fs::write(instance_dir.join("mods-list.json"), json) {
+            println!("Konnte mods-list.json nicht speichern: {e}");
+        }
+    }
+}
+
+fn load_mods_list(instance_dir: &Path) -> Vec<ModListEntry> {
+    let path = instance_dir.join("mods-list.json");
+    let Ok(file) = File::open(&path) else { return Vec::new(); };
+    serde_json::from_reader(BufReader::new(file)).unwrap_or_default()
+}
+
+// NEU: Extrahiert die Modrinth Project ID aus einer Download-URL
+// Format: https://cdn.modrinth.com/data/AANobbMI/versions/...
+fn extract_modrinth_project_id(url: &str) -> Option<String> {
+    if url.contains("/data/") {
+        let parts: Vec<&str> = url.split("/data/").collect();
+        if parts.len() >= 2 {
+            return parts[1].split('/').next().map(|s| s.to_string());
+        }
+    }
+    None
 }
 
 // Gemeinsamer HTTP-Client mit ordentlichem User-Agent (Modrinth bittet in
@@ -748,27 +788,40 @@ async fn install_mrpack(
         }
     }
 
-    // 3. Die in modrinth.index.json referenzierten Mod-Dateien einzeln nachladen
+        // 3. Die in modrinth.index.json referenzierten Mod-Dateien einzeln nachladen
+    // und gleichzeitig die mods-list.json aufbauen
     let total = index.files.len();
+    let mut mods_list: Vec<ModListEntry> = Vec::new();
+
     for (i, file) in index.files.iter().enumerate() {
         let Some(url) = file.downloads.first() else {
-            continue; // keine Download-URL angegeben, überspringen
+            continue;
         };
-
         report_progress(
             ui_handle,
             format!("Lade Mod {}/{}: {}", i + 1, total, file.path),
         );
-
         let bytes = download_bytes(url).await?;
         let out_path = instance_dir.join(&file.path);
-
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("Konnte Ordner nicht anlegen: {e}"))?;
         }
         fs::write(&out_path, &bytes)
             .map_err(|e| format!("Konnte Datei nicht schreiben ({}): {e}", file.path))?;
+
+        // NEU: Versuche, die Project ID aus der URL zu extrahieren
+        if let Some(project_id) = extract_modrinth_project_id(url) {
+            // file.path ist z.B. "mods/sodium.jar". Wir wollen nur den Dateinamen.
+            let filename = file.path.split('/').last().unwrap_or(&file.path).to_string();
+            mods_list.push(ModListEntry {
+                filename,
+                project_id,
+            });
+        }
     }
+    
+    // NEU: mods-list.json für diese Instanz speichern
+    save_mods_list(instance_dir, &mods_list);
 
     Ok(())
 }
@@ -1659,8 +1712,10 @@ async fn install_cf_modpack(
     let mods_dir = instance_dir.join("mods");
     fs::create_dir_all(&mods_dir).map_err(|e| format!("Konnte mods-Ordner nicht anlegen: {e}"))?;
 
-    // 3. Mods aus dem Manifest herunterladen
+    // 3. Mods aus dem Manifest herunterladen und mods-list.json erstellen
     let total = manifest.files.len();
+    let mut mods_list: Vec<ModListEntry> = Vec::new();
+
     for (i, file) in manifest.files.iter().enumerate() {
         report_progress(ui_handle, format!("Lade Mod {}/{} herunter...", i + 1, total));
         match download_cf_file(file.fileID).await {
@@ -1668,18 +1723,21 @@ async fn install_cf_modpack(
                 let mods_dir = instance_dir.join("mods");
                 fs::create_dir_all(&mods_dir).ok();
                 fs::write(mods_dir.join(&filename), &bytes).map_err(|e| format!("Mod speichern fehlgeschlagen: {e}"))?;
+                
+                // NEU: Zur Liste hinzufügen
+                mods_list.push(ModListEntry {
+                    filename: filename.clone(),
+                    project_id: file.projectID.to_string(),
+                });
             }
             Err(e) => {
                 println!("⚠️ Mod-Download übersprungen (Projekt-ID: {}, Datei-ID: {}): {}", file.projectID, file.fileID, e);
             }
         }
-
-        // NEU: Kurze Pause einfügen, um CurseForge Rate-Limits/Cloudflare zu umgehen
-        // 150ms ist ein guter Wert (Python hatte 100ms, aber Rust ist schneller)
-        //if i < total - 1 {
-        //    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        //}
     }
+    
+    // NEU: mods-list.json für diese Instanz speichern
+    save_mods_list(instance_dir, &mods_list);
 
     Ok((mc_version, loader))
 }
@@ -1803,6 +1861,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let add_mod_search_handle = handle.clone();
     let add_mod_install_handle = handle.clone();
     let compat_apply_handle = handle.clone();
+    let open_details_bg_handle = handle.clone(); // <-- NEU: Für den Icon-Nachlade-Task
+    let open_details_handle = handle.clone(); // <-- NEU: Für den Hintergrund-Task im Detail-Tab
 
     // Speichert Pack-Name + geladene Versionen für das aktuell offene
     // Install-Popup, damit on_browser_confirm_install (bekommt nur einen
@@ -2332,12 +2392,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                 for hit in hits {
                     let logo_url = hit.logo.as_ref().map(|l| l.thumbnailUrl.clone());
                     let id_str = hit.id.to_string();
-                    let score = calculate_score(&hit.name, &hit.author, &hit.summary, &query_str);
+                    
+                    // NEU: Nimm den Namen des ersten Autors, oder "Unknown" falls die Liste leer ist
+                    let author_name = hit.authors.first()
+                        .map(|a| a.name.clone())
+                        .unwrap_or_else(|| "Unknown".to_string());
+
+                    let score = calculate_score(&hit.name, &author_name, &hit.summary, &query_str);
+                    
                     packs_with_urls.push(PackWithUrl {
                         project_id: id_str,
                         name: hit.name,
                         summary: hit.summary,
-                        author: hit.author,
+                        author: author_name, // <-- GEÄNDERT: Den extrahierten Namen verwenden
                         icon_url: logo_url,
                         source: "CurseForge".to_string(),
                         score,
@@ -2743,9 +2810,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                 let primary_file = selected_version.files.iter().find(|f| f.primary).or_else(|| selected_version.files.first()).cloned();
 
-                // Loader-Version aus dem .mrpack lesen, BEVOR es installiert wird
-                let mut loader_version: Option<String> = None;
-
                 // Loader-Version aus dem .mrpack lesen, BEVOR es installiert wird.
                 // Bleibt None, wenn kein .mrpack vorliegt oder die Version nicht drinsteht.
                 let mut loader_version: Option<String> = None;
@@ -2918,21 +2982,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         });
     });
 
-    // Instanz-Details öffnen: liest Mods + Overrides + Icon der Instanz vom
-    // Datenträger und wechselt das Panel. Kein Netzwerk nötig, daher synchron
-    // statt spawn (läuft also bereits auf dem UI-Thread).
+        // Instanz-Details öffnen: liest Mods + Overrides + Icon der Instanz vom
+    // Datenträger und wechselt das Panel. Startet danach einen Hintergrund-Task,
+    // um fehlende Mod-Icons aus der mods-list.json nachzuladen.
     ui.on_open_instance_details(move |name| {
         let ui = open_details_ui_handle.unwrap();
-
         let launcherDir = dirs::data_local_dir()
             .expect("kein Local Data Dir")
             .join("srusm");
         let instance_dir = launcherDir.join("instances").join(name.to_string());
-
+        
+        // 1. Synchrones Laden der Basisdaten für sofortige UI-Anzeige
         let mods_raw = list_mod_files_raw(&instance_dir);
         let overrides = load_instance_overrides(&instance_dir);
-
-        // instance.json lesen, um das Pack-Icon fürs Detail-Header zu laden (best effort)
         let instance_icon_path: Option<PathBuf> = File::open(instance_dir.join("instance.json"))
             .ok()
             .and_then(|f| serde_json::from_reader::<_, ModpackJsonData>(BufReader::new(f)).ok())
@@ -2942,13 +3004,80 @@ fn main() -> Result<(), Box<dyn Error>> {
         ui.set_detail_instance_name(name.clone());
         ui.set_detail_instance_icon(load_icon(&instance_icon_path));
         ui.set_detail_mod_files(ModelRc::new(VecModel::from(
-            mods_raw.into_iter().map(build_mod_file_info).collect::<Vec<_>>(),
+            mods_raw.iter().cloned().map(build_mod_file_info).collect::<Vec<_>>(),
         )));
         ui.set_detail_overrides_enabled(overrides.enabled);
         ui.set_detail_ram_mb(overrides.ram_mb);
         ui.set_detail_java_path(overrides.java_path.into());
         ui.set_detail_username(overrides.username.into());
         ui.set_selected_panel("Instance Detail".into());
+
+        println!("📂 Detailansicht für '{}' geöffnet. Prüfe auf fehlende Icons...", name);
+
+        // 2. NEU: Hintergrund-Task zum Nachladen fehlender Icons (nur EIN UI-Update am Ende)
+        let bg_ui_handle = open_details_ui_handle.clone();
+        let bg_instance_dir = instance_dir.clone();
+        let bg_launcher_dir = launcherDir.clone();
+        let bg_handle = open_details_bg_handle.clone();
+
+        bg_handle.spawn(async move {
+            let cache_dir = bg_launcher_dir.join("icon_cache");
+            let mut icons = load_mod_icons(&bg_instance_dir);
+            
+            // Aktuelle Mods und Liste einlesen
+            let current_mods = list_mod_files_raw(&bg_instance_dir);
+            let mods_list = load_mods_list(&bg_instance_dir);
+
+            // Sammle alle fehlenden Icons, die wir herunterladen müssen
+            let mut missing_icons: Vec<(String, String)> = Vec::new(); // (project_id, display_name)
+            for entry in &current_mods {
+                if entry.icon_path.is_some() {
+                    continue; // Bereits vorhanden
+                }
+                if let Some(list_entry) = mods_list.iter().find(|m| m.filename == entry.display_name) {
+                    missing_icons.push((list_entry.project_id.clone(), entry.display_name.clone()));
+                }
+            }
+
+            if !missing_icons.is_empty() {
+                println!("📥 Starte Hintergrund-Download von {} fehlenden Icons...", missing_icons.len());
+                
+                let mut new_icons_found = 0;
+
+                // Lade Icons nacheinander im Hintergrund ab.
+                // Das frisst weniger Leistung (keine Netzwerk/CPU-Spikes durch Parallel-Downloads),
+                // blockiert aber NICHT die UI, da es in einem eigenen Task läuft.
+                for (project_id, display_name) in missing_icons {
+                    if let Some(project_info) = fetch_project_info(&project_id).await {
+                        if let Some(icon_url) = project_info.icon_url {
+                            if let Some(cached_path) = cache_icon(&cache_dir, &project_id, &Some(icon_url)).await {
+                                println!("   ✅ Icon gecacht für: {}", display_name);
+                                icons.insert(display_name, cached_path.to_string_lossy().to_string());
+                                new_icons_found += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Wenn wir neue Icons haben, speichern und die UI *einmal* aktualisieren
+                if new_icons_found > 0 {
+                    save_mod_icons(&bg_instance_dir, &icons);
+                    println!("✨ {} Icons erfolgreich geladen. Aktualisiere UI einmalig...", new_icons_found);
+
+                    let _ = bg_ui_handle.upgrade_in_event_loop(move |ui| {
+                        let new_mods = list_mod_files_raw(&bg_instance_dir);
+                        ui.set_detail_mod_files(ModelRc::new(VecModel::from(
+                            new_mods.into_iter().map(build_mod_file_info).collect::<Vec<_>>()
+                        )));
+                        println!("   🔄 UI für Mods aktualisiert.");
+                    });
+                } else {
+                    println!("✨ Keine neuen Icons gefunden oder alle Downloads fehlgeschlagen.");
+                }
+            } else {
+                println!("✨ Alle Icons sind bereits vorhanden.");
+            }
+        });
     });
 
     // Mod aktivieren/deaktivieren (Umbenennen), danach Liste neu laden damit
@@ -2969,29 +3098,33 @@ fn main() -> Result<(), Box<dyn Error>> {
         )));
     });
 
-    // Mod entfernen, danach Liste neu laden.
+        // Mod entfernen, danach Liste neu laden.
     ui.on_detail_remove_mod(move |instance_name, filename| {
         let ui = remove_mod_ui_handle.unwrap();
-
         let launcherDir = dirs::data_local_dir()
             .expect("kein Local Data Dir")
             .join("srusm");
         let instance_dir = launcherDir.join("instances").join(instance_name.to_string());
-
         remove_mod_file(&instance_dir, &filename);
-
-        // meta/icons anhand des Dateinamens aufräumen (ggf. ".disabled"-Suffix entfernen,
-        // weil mod_meta.json den Namen OHNE Suffix speichert)
+        
+        // meta/icons anhand des Dateinamens aufräumen (ggf. ".disabled"-Suffix entfernen)
         let plain_name = filename.strip_suffix(".disabled").unwrap_or(&filename).to_string();
-
         let mut meta = load_mod_meta(&instance_dir);
         meta.retain(|m| m.filename != plain_name);
         save_mod_meta(&instance_dir, &meta);
-
+        
+        // FIX: icons erst laden, dann Eintrag entfernen, dann speichern
         let mut icons = load_mod_icons(&instance_dir);
         icons.remove(&plain_name);
         save_mod_icons(&instance_dir, &icons);
-
+        
+        // NEU: mods-list.json aus dem aktualisierten meta-Array regenerieren
+        let mods_list: Vec<ModListEntry> = meta.iter().map(|m| ModListEntry {
+            filename: m.filename.clone(),
+            project_id: m.project_id.clone(),
+        }).collect();
+        save_mods_list(&instance_dir, &mods_list);
+        
         let mods_raw = list_mod_files_raw(&instance_dir);
         ui.set_detail_mod_files(ModelRc::new(VecModel::from(
             mods_raw.into_iter().map(build_mod_file_info).collect::<Vec<_>>(),
@@ -3369,38 +3502,27 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             for (project_id, rmod) in final_state.iter() {
                 if !confirmed_ids.contains(project_id) { continue; }
-
                 let Some(file) = rmod.version.files.iter().find(|f| f.primary).or_else(|| rmod.version.files.first()) else { continue; };
-
                 push_debug_log(&ui_handle, format!("Lade {} für {}...", file.filename, rmod.project_name));
                 let Ok(bytes) = download_bytes(&file.url).await else {
                     push_debug_log(&ui_handle, format!("Download fehlgeschlagen für {}", rmod.project_name));
                     continue;
                 };
-
                 // Alte Datei dieses Projekts entfernen, falls es ein Versionswechsel ist.
                 if let Some(old) = meta.iter().find(|m| &m.project_id == project_id) {
-                    // 1. Normale Datei entfernen
                     let _ = fs::remove_file(mods_dir.join(&old.filename));
-                    // 2. WICHTIG: Auch die deaktivierte Variante entfernen, falls der Mod deaktiviert war!
                     let _ = fs::remove_file(mods_dir.join(format!("{}.disabled", old.filename)));
-                    
-                    // 3. Altes Icon-Mapping bereinigen, falls sich der Dateiname geändert hat
                     icons.remove(&old.filename);
                 }
-
                 if let Err(e) = fs::write(mods_dir.join(&file.filename), &bytes) {
                     push_debug_log(&ui_handle, format!("Konnte Datei nicht schreiben: {e}"));
                     continue;
                 }
-
                 let icon_url = fetch_project_icon_url(project_id).await;
                 let icon_path = cache_icon(&icon_cache_dir, project_id, &icon_url).await;
-                
                 if let Some(path) = &icon_path {
                     icons.insert(file.filename.clone(), path.to_string_lossy().to_string());
                 }
-
                 meta.retain(|m| &m.project_id != project_id);
                 meta.push(ModEntryMeta {
                     filename: file.filename.clone(),
@@ -3409,9 +3531,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                     version_id: rmod.version.id.clone(),
                 });
             }
-
+            
             save_mod_meta(&instance_dir, &meta);
             save_mod_icons(&instance_dir, &icons); // Einmaliges Speichern am Ende
+            
+            // FIX: mods-list.json einfach aus dem aktualisierten meta regenerieren
+            // (Das ersetzt den fehlerhaften 'current_list' Code)
+            let mods_list: Vec<ModListEntry> = meta.iter().map(|m| ModListEntry {
+                filename: m.filename.clone(),
+                project_id: m.project_id.clone(),
+            }).collect();
+            save_mods_list(&instance_dir, &mods_list);
 
             let mods_raw = list_mod_files_raw(&instance_dir);
             let _ = ui_handle.upgrade_in_event_loop(move |ui| {
