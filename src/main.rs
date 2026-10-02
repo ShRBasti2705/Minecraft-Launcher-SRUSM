@@ -20,6 +20,7 @@ use lyceris::minecraft::loader::{
 use lyceris::minecraft::emitter::{Emitter, Event};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 slint::include_modules!();
 
@@ -59,8 +60,6 @@ struct LauncherSettings {
     show_snapshots: bool,
     #[serde(default = "default_items_per_page")]
     items_per_page: i32,
-    #[serde(default)]
-    debug_ui: bool,
 }
 
 fn default_items_per_page() -> i32 { 12 }
@@ -86,7 +85,6 @@ impl Default for LauncherSettings {
             open_on_startup: false,
             show_snapshots: false,
             items_per_page: 12,
-            debug_ui: false,
         }
     }
 }
@@ -315,6 +313,7 @@ struct ModFileEntry {
     enabled: bool,
     icon_path: Option<String>,
     duplicate: bool, // Mod kommt mehrfach vor (orange in der UI)
+    dup_total: i32,
 }
 
 // Verknüpft eine Mod-Datei mit ihrer Modrinth-Herkunft (project_id + gewählte
@@ -374,6 +373,7 @@ fn load_mods_list(instance_dir: &Path) -> Vec<ModListEntry> {
 
 // NEU: Extrahiert die Modrinth Project ID aus einer Download-URL
 // Format: https://cdn.modrinth.com/data/AANobbMI/versions/...
+
 fn extract_modrinth_project_id(url: &str) -> Option<String> {
     if url.contains("/data/") {
         let parts: Vec<&str> = url.split("/data/").collect();
@@ -433,6 +433,7 @@ fn http_client() -> &'static reqwest::Client {
     let response: ModrinthSearchResponse = fetch(url, None).await.ok()?;
     Some(response.hits)
 }*/
+
 async fn search_projects(query: &str, project_type: &str, limit: i32, sort: &str, extra_facets: &[String]) -> Option<Vec<ModrinthHit>> {
     let escaped_query = query.replace(' ', "%20");
     let limit = limit.clamp(1, 100);
@@ -462,6 +463,7 @@ async fn search_projects(query: &str, project_type: &str, limit: i32, sort: &str
 
 // Lädt alle verfügbaren Versionen eines Modrinth-Projekts (Modpack oder Mod).
 // Neueste zuerst laut Modrinth-API-Reihenfolge.
+
 async fn fetch_pack_versions(project_id: &str) -> Option<Vec<ModrinthVersionInfo>> {
     let url = format!("https://api.modrinth.com/v2/project/{}/version", project_id);
     fetch(url, None).await.ok()
@@ -469,11 +471,13 @@ async fn fetch_pack_versions(project_id: &str) -> Option<Vec<ModrinthVersionInfo
 
 // Fragt die icon_url eines Modrinth-Projekts ab (falls nicht schon aus einem
 // Suchtreffer bekannt, z.B. beim Bestätigen einer Installation).
+
 async fn fetch_project_icon_url(project_id: &str) -> Option<String> {
     let url = format!("https://api.modrinth.com/v2/project/{}", project_id);
     let project: ModrinthProjectInfo = fetch(url, None).await.ok()?;
     project.icon_url
 }
+
 
 async fn fetch_project_info(project_id: &str) -> Option<ModrinthProjectInfo> {
     let url = format!("https://api.modrinth.com/v2/project/{}", project_id);
@@ -546,6 +550,7 @@ async fn fetch_project_info(project_id: &str) -> Option<ModrinthProjectInfo> {
     let response: ModrinthSearchResponse = fetch(url, None).await.ok()?;
     Some(response.hits)
 }*/
+
 
 async fn search_cf_projects(query: &str, limit: i32, sort_by_downloads: bool) -> Option<Vec<CfSearchHit>> {
     let limit = limit.clamp(1, 100);
@@ -626,6 +631,7 @@ async fn search_cf_projects(query: &str, limit: i32, sort_by_downloads: bool) ->
 }
 
 // <-- NEU: CurseForge Versionen (Dateien) eines Modpacks abrufen
+
 async fn fetch_cf_files(project_id: &str) -> Option<Vec<CfFile>> {
     let url = format!("https://api.curseforge.com/v1/mods/{}/files", project_id);
     let client = http_client();
@@ -639,6 +645,7 @@ async fn fetch_cf_files(project_id: &str) -> Option<Vec<CfFile>> {
 }
 
 // <-- NEU: Einzelne Mod von CurseForge herunterladen (für Manifest-Verarbeitung)
+
 async fn download_cf_file(file_id: i64) -> Result<(String, Vec<u8>), String> {
     let url = format!("https://api.curseforge.com/v1/mods/files/{}", file_id);
     let client = http_client();
@@ -663,6 +670,7 @@ async fn fetch_version_by_id(version_id: &str) -> Option<ModrinthVersionInfo> {
 }
 
 // Lädt eine URL als rohe Bytes herunter (für .mrpack-Archive und einzelne Mod-Dateien).
+#[hotpath::measure]
 async fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
     let response = http_client()
         .get(url)
@@ -686,6 +694,8 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
 // einfach nichts (kein Fehler, nur ein leeres Bild) - das war der Grund für
 // fehlende Icons. Deshalb wird hier über die "image"-Crate dekodiert und
 // IMMER als PNG zwischengespeichert, unabhängig vom Quellformat.
+
+#[hotpath::measure]
 async fn cache_icon(icon_cache_dir: &Path, key: &str, icon_url: &Option<String>) -> Option<PathBuf> {
     let url = icon_url.as_ref()?;
     let cache_path = icon_cache_dir.join(format!("{key}.png"));
@@ -693,12 +703,22 @@ async fn cache_icon(icon_cache_dir: &Path, key: &str, icon_url: &Option<String>)
     if !cache_path.is_file() {
         let bytes = download_bytes(url).await.ok()?;
 
-        // WICHTIG: image:: (die Crate), nicht slint::Image!
-        let decoded = image::load_from_memory(&bytes).ok()?;
-        fs::create_dir_all(icon_cache_dir).ok()?;
-        decoded
-            .save_with_format(&cache_path, image::ImageFormat::Png)
-            .ok()?;
+        // Decode + Resize in spawn_blocking, damit der Tokio-Worker frei bleibt
+        // und andere Icon-Downloads parallel laufen koennen.
+        let cdir = icon_cache_dir.to_path_buf();
+        let cpath = cache_path.clone();
+        tokio::task::spawn_blocking(move || -> Option<()> {
+            let decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
+            let resized = image::imageops::resize(
+                &decoded, 96, 96,
+                image::imageops::FilterType::Triangle,
+            );
+            fs::create_dir_all(&cdir).ok()?;
+            resized.save_with_format(&cpath, image::ImageFormat::Png).ok()?;
+            Some(())
+        })
+        .await
+        .ok()??;
     }
 
     Some(cache_path)
@@ -708,6 +728,7 @@ async fn cache_icon(icon_cache_dir: &Path, key: &str, icon_url: &Option<String>)
 // werden (analog zu allen anderen Stellen, an denen wir erst nach dem
 // Thread-Wechsel Slint-Typen bauen). Fehlt der Pfad oder schlägt das Laden
 // fehl, kommt einfach ein leeres Bild zurück statt eines Absturzes.
+
 fn load_icon(path: &Option<PathBuf>) -> Image {
     match path {
         Some(p) => Image::load_from_path(p).unwrap_or_default(),
@@ -717,6 +738,7 @@ fn load_icon(path: &Option<PathBuf>) -> Image {
 
 // Schreibt eine kleine Statusmeldung ins Install-Popup, sicher vom Tokio-Thread
 // aus aufrufbar (Weak<AppWindow> ist Send, im Gegensatz zu Rc<VecModel<...>>).
+
 fn report_progress(ui_handle: &Weak<AppWindow>, text: String) {
     let _ = ui_handle.upgrade_in_event_loop(move |ui| {
         ui.set_install_popup_status(text.into());
@@ -724,6 +746,7 @@ fn report_progress(ui_handle: &Weak<AppWindow>, text: String) {
 }
 
 // Gleiches Prinzip wie report_progress, aber fürs Add-Mod-Popup in der Detailansicht.
+
 fn report_mod_progress(ui_handle: &Weak<AppWindow>, text: String) {
     let _ = ui_handle.upgrade_in_event_loop(move |ui| {
         ui.set_add_mod_status(text.into());
@@ -732,117 +755,114 @@ fn report_mod_progress(ui_handle: &Weak<AppWindow>, text: String) {
 
 // Ringpuffer für Debug-Meldungen, wird bei aktivem debug_ui in die UI gespiegelt.
 // Macht selbst nichts, wenn debug_ui aus ist (spart die Model-Rebuild-Arbeit).
-fn push_debug_log(ui_handle: &Weak<AppWindow>, message: String) {
-    let _ = ui_handle.upgrade_in_event_loop(move |ui| {
-        if !ui.get_debug_ui() { return; }
-        let model = ui.get_debug_log();
-        let mut items: Vec<SharedString> = (0..model.row_count())
-            .filter_map(|i| model.row_data(i))
-            .collect();
-        items.push(message.into());
-        if items.len() > 200 { items.remove(0); } // Ringpuffer, kein unbegrenztes Wachstum
-        ui.set_debug_log(ModelRc::new(VecModel::from(items)));
-    });
-}
+//fn push_debug_log(ui_handle: &Weak<AppWindow>, message: String) {
+//    let _ = ui_handle.upgrade_in_event_loop(move |ui| {
+//        if !ui.get_debug_ui() { return; }
+//        let model = ui.get_debug_log();
+//        let mut items: Vec<SharedString> = (0..model.row_count())
+//            .filter_map(|i| model.row_data(i))
+//            .collect();
+//        items.push(message.into());
+//        if items.len() > 200 { items.remove(0); } // Ringpuffer, kein unbegrenztes Wachstum
+//        ui.set_debug_log(ModelRc::new(VecModel::from(items)));
+//    });
+//}
 
 // Entpackt ein .mrpack-Archiv (Zip) in den Instanz-Ordner:
 // - "overrides/" bzw. "client-overrides/" werden 1:1 in den Instanz-Ordner kopiert
 //   (Configs, Resourcepacks, Shader etc., die im Pack mitgeliefert werden)
 // - "modrinth.index.json" listet die eigentlichen Mod-Jars, die wir einzeln
 //   nachladen und unter ihrem "path" (meist "mods/xyz.jar") ablegen
+#[hotpath::measure]
 async fn install_mrpack(
     instance_dir: &PathBuf,
     mrpack_bytes: Vec<u8>,
     ui_handle: &Weak<AppWindow>,
 ) -> Result<(), String> {
-    let cursor = Cursor::new(mrpack_bytes);
-    let mut archive = zip::ZipArchive::new(cursor)
-        .map_err(|e| format!("Konnte .mrpack nicht als Zip öffnen: {e}"))?;
+    // Alles Blocking (Zip öffnen, Index lesen, Overrides entpacken) in EINEM
+    // spawn_blocking-Block. Die Downloads danach laufen wieder async.
+    let dir = instance_dir.clone();
+    let ui_for_progress = ui_handle.clone();
 
-    // 1. modrinth.index.json einlesen, dort steht drin welche Mods geladen werden müssen
-    let index: MrpackIndex = {
-        let mut index_file = archive
-            .by_name("modrinth.index.json")
-            .map_err(|e| format!("modrinth.index.json fehlt im .mrpack: {e}"))?;
-        let mut contents = String::new();
-        index_file
-            .read_to_string(&mut contents)
-            .map_err(|e| format!("Konnte modrinth.index.json nicht lesen: {e}"))?;
-        serde_json::from_str(&contents)
-            .map_err(|e| format!("Konnte modrinth.index.json nicht parsen: {e}"))?
-    };
+    let index = tokio::task::spawn_blocking(move || -> Result<MrpackIndex, String> {
+        let cursor = Cursor::new(mrpack_bytes);
+        let mut archive = zip::ZipArchive::new(cursor)
+            .map_err(|e| format!("Konnte .mrpack nicht als Zip öffnen: {e}"))?;
 
-    // 2. overrides/ direkt aus dem Zip-Archiv in den Instanz-Ordner entpacken
-    report_progress(ui_handle, "Entpacke Overrides...".to_string());
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| format!("Zip-Fehler: {e}"))?;
-        let name = entry.name().to_string();
-
-        let Some(rel_path) = name
-            .strip_prefix("overrides/")
-            .or_else(|| name.strip_prefix("client-overrides/"))
-        else {
-            continue; // kein Override-Eintrag, ignorieren (z.B. modrinth.index.json selbst)
+        // 1. modrinth.index.json
+        let index: MrpackIndex = {
+            let mut index_file = archive
+                .by_name("modrinth.index.json")
+                .map_err(|e| format!("modrinth.index.json fehlt im .mrpack: {e}"))?;
+            let mut contents = String::new();
+            index_file.read_to_string(&mut contents)
+                .map_err(|e| format!("Konnte modrinth.index.json nicht lesen: {e}"))?;
+            serde_json::from_str(&contents)
+                .map_err(|e| format!("Konnte modrinth.index.json nicht parsen: {e}"))?
         };
 
-        if rel_path.is_empty() {
-            continue; // der Ordner-Eintrag "overrides/" selbst
-        }
+        // 2. Overrides entpacken
+        let _ = ui_for_progress.upgrade_in_event_loop(|ui| {
+            ui.set_install_popup_status("Entpacke Overrides...".into());
+        });
 
-        let out_path = instance_dir.join(rel_path);
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).map_err(|e| format!("Zip-Fehler: {e}"))?;
+            let name = entry.name().to_string();
 
-        if entry.is_dir() {
-            fs::create_dir_all(&out_path).map_err(|e| format!("Konnte Ordner nicht anlegen: {e}"))?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent).map_err(|e| format!("Konnte Ordner nicht anlegen: {e}"))?;
+            let Some(rel_path) = name
+                .strip_prefix("overrides/")
+                .or_else(|| name.strip_prefix("client-overrides/"))
+            else { continue; };
+
+            if rel_path.is_empty() { continue; }
+
+            let out_path = dir.join(rel_path);
+            if entry.is_dir() {
+                fs::create_dir_all(&out_path).map_err(|e| format!("Ordner anlegen: {e}"))?;
+            } else {
+                if let Some(parent) = out_path.parent() {
+                    fs::create_dir_all(parent).map_err(|e| format!("Ordner anlegen: {e}"))?;
+                }
+                let mut out_file = File::create(&out_path)
+                    .map_err(|e| format!("Datei anlegen: {e}"))?;
+                std::io::copy(&mut entry, &mut out_file)
+                    .map_err(|e| format!("Datei schreiben: {e}"))?;
             }
-            let mut out_file =
-                File::create(&out_path).map_err(|e| format!("Konnte Datei nicht anlegen: {e}"))?;
-            std::io::copy(&mut entry, &mut out_file)
-                .map_err(|e| format!("Konnte Datei nicht schreiben: {e}"))?;
         }
-    }
 
-        // 3. Die in modrinth.index.json referenzierten Mod-Dateien einzeln nachladen
-    // und gleichzeitig die mods-list.json aufbauen
+        Ok(index)
+    })
+    .await
+    .map_err(|e| format!("Interner Fehler beim Entpacken: {e}"))??;
+
+    // 3. Mod-Dateien einzeln nachladen (async, wie bisher)
     let total = index.files.len();
     let mut mods_list: Vec<ModListEntry> = Vec::new();
 
     for (i, file) in index.files.iter().enumerate() {
-        let Some(url) = file.downloads.first() else {
-            continue;
-        };
-        report_progress(
-            ui_handle,
-            format!("Lade Mod {}/{}: {}", i + 1, total, file.path),
-        );
+        let Some(url) = file.downloads.first() else { continue; };
+        report_progress(ui_handle, format!("Lade Mod {}/{}: {}", i + 1, total, file.path));
         let bytes = download_bytes(url).await?;
         let out_path = instance_dir.join(&file.path);
         if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("Konnte Ordner nicht anlegen: {e}"))?;
+            fs::create_dir_all(parent).map_err(|e| format!("Ordner anlegen: {e}"))?;
         }
         fs::write(&out_path, &bytes)
-            .map_err(|e| format!("Konnte Datei nicht schreiben ({}): {e}", file.path))?;
+            .map_err(|e| format!("Datei schreiben ({}): {e}", file.path))?;
 
-        // NEU: Versuche, die Project ID aus der URL zu extrahieren
         if let Some(project_id) = extract_modrinth_project_id(url) {
-            // file.path ist z.B. "mods/sodium.jar". Wir wollen nur den Dateinamen.
             let filename = file.path.split('/').last().unwrap_or(&file.path).to_string();
-            mods_list.push(ModListEntry {
-                filename,
-                project_id,
-            });
+            mods_list.push(ModListEntry { filename, project_id });
         }
     }
-    
-    // NEU: mods-list.json für diese Instanz speichern
-    save_mods_list(instance_dir, &mods_list);
 
+    save_mods_list(instance_dir, &mods_list);
     Ok(())
 }
 
 // Liest nur die modrinth.index.json aus einem .mrpack (Zip im Speicher), ohne etwas zu entpacken.
+
 fn read_mrpack_index(bytes: &[u8]) -> Result<MrpackIndex, String> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
         .map_err(|e| format!("Datei ist kein gültiges .mrpack (Zip): {e}"))?;
@@ -863,6 +883,7 @@ fn read_mrpack_index(bytes: &[u8]) -> Result<MrpackIndex, String> {
 
 // Bestimmt aus den "dependencies" die Minecraft-Version und unseren Loader-Kind
 // ("fabric" | "quilt" | "neoforge" | "forge" | "none").
+
 fn mrpack_mc_and_loader(deps: &HashMap<String, String>) -> (String, String) {
     let mc = deps.get("minecraft").cloned().unwrap_or_default();
     let loader = if deps.contains_key("fabric-loader") {
@@ -881,6 +902,7 @@ fn mrpack_mc_and_loader(deps: &HashMap<String, String>) -> (String, String) {
 
 // Liest die vom .mrpack geforderte Loader-Version aus den "dependencies".
 // Die Schlüssel heißen je nach Loader anders (z.B. "fabric-loader" für Fabric).
+
 fn mrpack_loader_version(deps: &HashMap<String, String>, loader_kind: &str) -> Option<String> {
     let key = match loader_kind {
         "fabric" => "fabric-loader",
@@ -894,6 +916,7 @@ fn mrpack_loader_version(deps: &HashMap<String, String>, loader_kind: &str) -> O
 
 // Zerlegt eine CurseForge-Loader-ID wie "fabric-0.16.9" in ("fabric", Some("0.16.9")).
 // Eine ID ohne "-" (z.B. "none") ergibt (id, None).
+
 fn split_loader_id(id: &str) -> (String, Option<String>) {
     match id.split_once('-') {
         Some((kind, ver)) if !ver.is_empty() => (kind.to_lowercase(), Some(ver.to_string())),
@@ -903,6 +926,7 @@ fn split_loader_id(id: &str) -> (String, Option<String>) {
 
 // Bereinigt einen eingefügten Pfad: Anführungszeichen (kommen z.B. beim Reinziehen ins Terminal),
 // file://-Prefix (manche Dateimanager) und "~/" werden aufgelöst.
+
 fn clean_path_input(input: &str) -> PathBuf {
     let mut s = input
         .trim()
@@ -924,6 +948,7 @@ fn clean_path_input(input: &str) -> PathBuf {
 }
 
 // Entfernt Zeichen, die in Ordnernamen Probleme machen (v.a. unter Windows).
+
 fn sanitize_dir_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -934,6 +959,7 @@ fn sanitize_dir_name(name: &str) -> String {
 
 // Existiert schon eine Instanz mit dem Namen, wird " (2)", " (3)", ... angehängt,
 // damit ein Import nie eine bestehende Instanz überschreibt.
+
 fn unique_instance_name(instances_dir: &Path, base: &str) -> String {
     if !instances_dir.join(base).exists() {
         return base.to_string();
@@ -950,6 +976,7 @@ fn unique_instance_name(instances_dir: &Path, base: &str) -> String {
 
 // Fallback für Versionen OHNE .mrpack (z.B. einzelne Mod-Jars als "files"):
 // lädt jede Datei einzeln direkt in den "mods"-Unterordner der Instanz.
+
 async fn download_files_direct(
     instance_dir: &PathBuf,
     files: &[ModrinthFile],
@@ -976,6 +1003,7 @@ async fn download_files_direct(
 // Sucht unter den Versionen eines Mod-Projekts die beste Übereinstimmung zur
 // Ziel-Minecraft-Version (und wenn bekannt zum Loader), sonst einfach die
 // neueste Version. Best-effort, kein hartes Ausschlusskriterium.
+
 fn pick_best_matching_version<'a>(
     versions: &'a [ModrinthVersionInfo],
     mc_version: &str,
@@ -1019,6 +1047,7 @@ fn state_signature(state: &HashMap<String, ResolvedMod>) -> Vec<(String, String)
 // vorhanden sind) - ein "required" auf eine Mod, die gar nicht installiert
 // ist, wird bewusst nicht als Problem gewertet, weil wir keine automatische
 // Mod-Auto-Installation von Fremdabhängigkeiten machen (Scope-Entscheidung).
+#[hotpath::measure]
 fn find_problems(state: &HashMap<String, ResolvedMod>) -> Vec<Problem> {
     let mut problems = Vec::new();
     for (pid, rmod) in state.iter() {
@@ -1089,6 +1118,7 @@ fn find_problems(state: &HashMap<String, ResolvedMod>) -> Vec<Problem> {
 // NEU: Umfassende Kompatibilitätsprüfung.
 // Prüft, ob Version `v` mit der angegebenen Version eines anderen Projekts kompatibel ist.
 // Berücksichtigt sowohl "incompatible" als auch "required" Dependencies mit spezifischen version_ids.
+
 fn is_compatible_with(v: &ModrinthVersionInfo, other_project: &str, other_version_id: &str) -> bool {
     v.dependencies.iter().all(|d| {
         if d.project_id.as_deref() != Some(other_project) {
@@ -1115,6 +1145,7 @@ fn is_compatible_with(v: &ModrinthVersionInfo, other_project: &str, other_versio
 
 // Sucht eine andere Version von `to_change`, die mit der AKTUELLEN Version von `other` 
 // kreuzweise verträglich ist. Prüft beide Richtungen.
+
 async fn find_alternate_compatible_version(
     to_change: &str,
     other: &str,
@@ -1150,6 +1181,7 @@ async fn find_alternate_compatible_version(
 // Gibt die EINE Version älter als die aktuell gewählte zurück (Modrinth liefert
 // neueste zuerst, also: nächstes Element nach der aktuellen Position).
 // None wenn es keine ältere (passende) Version mehr gibt.
+
 async fn downgrade_project(
     project_id: &str,
     state: &HashMap<String, ResolvedMod>,
@@ -1173,6 +1205,7 @@ async fn downgrade_project(
 // Rekursiv (iterativ mit Memoisation) versuchen, einen widerspruchsfreien
 // Zustand zu finden. Ok(state) = Lösung gefunden. Err(state) = keine Lösung,
 // state zeigt den letzten (weiterhin fehlerhaften) Versuch für die UI.
+#[hotpath::measure]
 async fn resolve_compatibility(
     mut state: HashMap<String, ResolvedMod>,
     mc_version: &str,
@@ -1185,25 +1218,25 @@ async fn resolve_compatibility(
     for iteration in 0..MAX_ITERATIONS {
         let signature = state_signature(&state);
         if tried.contains(&signature) {
-            push_debug_log(ui_handle, "Resolver: Zustand bereits versucht, breche ab.".to_string());
+            //push_debug_log(ui_handle, "Resolver: Zustand bereits versucht, breche ab.".to_string());
             return Err(state);
         }
         tried.insert(signature);
 
         let problems = find_problems(&state);
         if problems.is_empty() {
-            push_debug_log(ui_handle, format!("Resolver: Lösung gefunden nach {} Durchlauf/Durchläufen.", iteration + 1));
+            //push_debug_log(ui_handle, format!("Resolver: Lösung gefunden nach {} Durchlauf/Durchläufen.", iteration + 1));
             return Ok(state);
         }
 
-        push_debug_log(ui_handle, format!("Resolver Durchlauf {}: {} Problem(e) gefunden.", iteration + 1, problems.len()));
+        //push_debug_log(ui_handle, format!("Resolver Durchlauf {}: {} Problem(e) gefunden.", iteration + 1, problems.len()));
         
         // Erst versuchen, ein "braucht andere Version"-Problem zu fixen (billiger als Konflikt-Suche).
         let mut fixed = false;
         let mut added_missing = false;
         for problem in &problems {
             if let Problem::MissingRequired { project_id, version_id, requested_by } = problem {
-                push_debug_log(ui_handle, format!("Fehlende Abhängigkeit: {} (benötigt von {}).", project_id, requested_by));
+                //push_debug_log(ui_handle, format!("Fehlende Abhängigkeit: {} (benötigt von {}).", project_id, requested_by));
 
                 let version = if let Some(vid) = version_id {
                     fetch_version_by_id(vid).await
@@ -1213,7 +1246,7 @@ async fn resolve_compatibility(
                 };
 
                 let Some(version) = version else {
-                    push_debug_log(ui_handle, format!("Konnte keine Version für {} laden.", project_id));
+                    //push_debug_log(ui_handle, format!("Konnte keine Version für {} laden.", project_id));
                     continue;
                 };
 
@@ -1230,13 +1263,13 @@ async fn resolve_compatibility(
             }
             // --- HIER IST DIE VERBESSERTE LOGIK FÜR NEEDS VERSION ---
             if let Problem::NeedsVersion { project_id, required_version_id, requested_by } = problem {
-                push_debug_log(ui_handle, format!("Versionskonflikt: {} benötigt {} in Version {}.", requested_by, project_id, required_version_id));
+                //push_debug_log(ui_handle, format!("Versionskonflikt: {} benötigt {} in Version {}.", requested_by, project_id, required_version_id));
                 
                 // SCHRITT 1: Zuerst versuchen, den anfordernden Mod (z.B. Iris) herunterzustufen,
                 // damit er mit der AKTUELLEN Version von project_id (z.B. Sodium) kompatibel ist.
                 // Das verhindert, dass wir Sodium upgraden und dadurch Konflikte mit Voxy erzeugen.
                 if let Some(alternate) = find_alternate_compatible_version(requested_by, project_id, &state, mc_version, loader_kind).await {
-                    push_debug_log(ui_handle, format!("Lösung: Downgrade von {} auf {}, um mit {} kompatibel zu sein.", requested_by, alternate.version_number, project_id));
+                    //push_debug_log(ui_handle, format!("Lösung: Downgrade von {} auf {}, um mit {} kompatibel zu sein.", requested_by, alternate.version_number, project_id));
                     if let Some(existing) = state.get_mut(requested_by) {
                         existing.version = alternate;
                         fixed = true;
@@ -1245,7 +1278,7 @@ async fn resolve_compatibility(
                 } else {
                     // SCHRITT 2 (Fallback): Wenn kein kompatibles Downgrade für requested_by gefunden wurde,
                     // versuchen wir immer noch, project_id auf die benötigte Version zu setzen.
-                    push_debug_log(ui_handle, format!("Kein kompatibles Downgrade für {} gefunden. Versuche Upgrade von {}.", requested_by, project_id));
+                    //push_debug_log(ui_handle, format!("Kein kompatibles Downgrade für {} gefunden. Versuche Upgrade von {}.", requested_by, project_id));
                     if let Some(version) = fetch_version_by_id(required_version_id).await {
                         if let Some(existing) = state.get_mut(project_id) {
                             existing.version = version;
@@ -1253,7 +1286,7 @@ async fn resolve_compatibility(
                             break;
                         }
                     } else {
-                        push_debug_log(ui_handle, format!("Konnte Version {} nicht laden.", required_version_id));
+                        //push_debug_log(ui_handle, format!("Konnte Version {} nicht laden.", required_version_id));
                     }
                 }
             }
@@ -1261,17 +1294,17 @@ async fn resolve_compatibility(
         if fixed { continue; }
         if added_missing { continue; }
 
-        push_debug_log(ui_handle, format!("Resolver Durchlauf {}: {} Problem(e) gefunden.", iteration + 1, problems.len()));
+        //push_debug_log(ui_handle, format!("Resolver Durchlauf {}: {} Problem(e) gefunden.", iteration + 1, problems.len()));
 
         let mut resolved = false;
         for problem in &problems {
             if let Problem::Incompatible { a, b } = problem {
                 for to_change in [a, b] {
                     let other = if to_change == a { b } else { a };
-                    push_debug_log(ui_handle, format!(
-                        "Inkompatibilität: {} <-> {}. Suche Alternative für {}.",
-                        a, b, to_change
-                    ));
+                    //push_debug_log(ui_handle, format!(
+                    //    "Inkompatibilität: {} <-> {}. Suche Alternative für {}.",
+                    //    a, b, to_change
+                    //));
                     if let Some(candidate) =
                         find_alternate_compatible_version(to_change, other, &state, mc_version, loader_kind).await
                     {
@@ -1312,9 +1345,9 @@ async fn resolve_compatibility(
                 .find(|m| m.project_name == trouble_name)
                 .map(|m| m.project_id.clone())
             {
-                push_debug_log(ui_handle, format!(
-                    "Resolver: versuche Downgrade von {} ({})...", trouble_name, trouble_id
-                ));
+                //push_debug_log(ui_handle, format!(
+                //    "Resolver: versuche Downgrade von {} ({})...", trouble_name, trouble_id
+                //));
                 if let Some(older) =
                     downgrade_project(&trouble_id, &state, mc_version, loader_kind).await
                 {
@@ -1323,15 +1356,15 @@ async fn resolve_compatibility(
                         continue; // neuen Durchlauf mit der älteren Version starten
                     }
                 }
-                push_debug_log(ui_handle, format!("Resolver: {} hat keine ältere Version mehr.", trouble_name));
+                //push_debug_log(ui_handle, format!("Resolver: {} hat keine ältere Version mehr.", trouble_name));
             }
         }
 
-        push_debug_log(ui_handle, "Resolver: keine automatische Lösung mehr möglich.".to_string());
+        //push_debug_log(ui_handle, "Resolver: keine automatische Lösung mehr möglich.".to_string());
         return Err(state);
     }
 
-    push_debug_log(ui_handle, "Resolver: Iterationslimit erreicht.".to_string());
+    //push_debug_log(ui_handle, "Resolver: Iterationslimit erreicht.".to_string());
     Err(state)
 }
 
@@ -1340,6 +1373,7 @@ async fn resolve_compatibility(
 // hier, da einzelne Mods normalerweise keine .mrpack-Dateien sind.
 // Gibt bei Erfolg (Dateiname, Versionsnummer) zurück, damit der Aufrufer
 // danach noch das Icon dazu cachen und in mod_icons.json eintragen kann.
+
 async fn install_mod_into_instance(
     instance_dir: &PathBuf,
     project_id: &str,
@@ -1375,9 +1409,136 @@ async fn install_mod_into_instance(
     Ok((file.filename.clone(), version.version_number.clone()))
 }
 
+// NEU, auf Modul-Ebene (vor struct InstanceCache):
+
+/// Konvertiert rohe RGBA-Bytes in ein Slint-Image (nur UI-Thread).
+#[hotpath::measure]
+fn rgba_to_image(rgba: &[u8], w: u32, h: u32) -> Image {
+    let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
+    buffer.make_mut_bytes().copy_from_slice(rgba);
+    Image::from_rgba8(buffer)
+}
+
+/// Laedt ein PNG von Platte als rohe RGBA-Bytes (Send).
+/// Die Icons sind bereits auf 96x96 verkleinert gecacht (siehe cache_icon),
+/// deshalb ist hier KEIN Resize mehr noetig.
+#[hotpath::measure]
+fn load_icon_as_pixels(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
+    let img = image::open(path).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    Some((img.into_raw(), w, h))
+}
+
+// ===================== Instance-Cache (#2/#3/#8) =====================
+// Hält pro Instanz die geladene Mod-Liste + Icons (als rohe RGBA-Bytes, weil
+// slint::Image nicht Send ist). Wird beim ersten Öffnen befüllt und danach
+// bei Filter-Tippen/Toggle nur aus dem Speicher gelesen.
+struct InstanceCache {
+    mods: Vec<ModFileEntry>,                       // rohe Einträge ohne Icon
+    icons: HashMap<String, (Vec<u8>, u32, u32)>,   // display_name -> RGBA-Pixel
+    loaded: bool,
+}
+
+// UI-thread-only cache for slint::Image objects. Image is not Send, so it can't
+// live in the Send-safe InstanceCache — but list_mod_files_cached only ever
+// runs on the UI thread anyway, so a thread-local is fine.
+thread_local! {
+    static UI_IMAGE_CACHE: std::cell::RefCell<HashMap<(String, String), Image>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Holt das Slint-Image aus dem UI-Cache oder baut es einmalig aus den Pixeln.
+/// Muss auf dem UI-Thread laufen.
+fn cached_ui_image(
+    instance_name: &str,
+    display_name: &str,
+    pixels: Option<&(Vec<u8>, u32, u32)>,
+) -> Image {
+    UI_IMAGE_CACHE.with(|cache| {
+        let key = (instance_name.to_string(), display_name.to_string());
+        let mut cache = cache.borrow_mut();
+        if let Some(img) = cache.get(&key) {
+            return img.clone();
+        }
+        let img = match pixels {
+            Some((rgba, w, h)) => rgba_to_image(rgba, *w, *h),
+            None => Image::default(),
+        };
+        cache.insert(key, img.clone());
+        img
+    })
+}
+
+static INSTANCE_CACHE: OnceLock<Mutex<HashMap<String, InstanceCache>>> = OnceLock::new();
+#[hotpath::measure]
+fn instance_cache() -> &'static Mutex<HashMap<String, InstanceCache>> {
+    INSTANCE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Cache für eine Instanz verwerfen (nach Toggle/Remove/Add).
+#[hotpath::measure]
+fn invalidate_instance_cache(instance_name: &str) {
+    if let Ok(mut c) = instance_cache().lock() {
+        c.remove(instance_name);
+    }
+}
+
+/// Baut die Mod-Liste einer Instanz aus dem Cache (lädt sie beim ersten Mal).
+/// MUSS auf dem UI-Thread laufen, weil slint::Image dort gebaut werden muss.
+#[hotpath::measure]
+fn list_mod_files_cached(instance_name: &str, instance_dir: &Path) -> Vec<ModFileInfo> {
+    let mut cache = instance_cache().lock().unwrap();
+    let entry = cache.entry(instance_name.to_string())
+        .or_insert_with(|| InstanceCache { mods: Vec::new(), icons: HashMap::new(), loaded: false });
+
+    if !entry.loaded {
+        let mods = list_mod_files_all(instance_dir);
+        let icons_json = load_mod_icons(instance_dir);
+
+        let mut icons_px = HashMap::with_capacity(icons_json.len());
+        for (name, path) in icons_json.iter() {
+            if let Some(px) = load_icon_as_pixels(Path::new(path)) {
+                icons_px.insert(name.clone(), px);
+            }
+        }
+
+        entry.mods = mods;
+        entry.icons = icons_px;
+        entry.loaded = true;
+
+        // Pixel haben sich geändert -> alte UI-Images für diese Instanz verwerfen.
+        // Wir sind hier garantiert auf dem UI-Thread (siehe Doc-Kommentar oben).
+        UI_IMAGE_CACHE.with(|c| {
+            c.borrow_mut().retain(|(inst, _), _| inst != instance_name);
+        });
+    }
+
+    // Nach Filter reduzieren + Slint-Images aus dem UI-Cache nehmen
+    let filter = mod_filter().lock().unwrap().to_lowercase();
+    entry.mods.iter()
+        .filter(|e| filter.is_empty() || e.display_name.to_lowercase().contains(&filter))
+        .map(|e| {
+            let icon = cached_ui_image(
+                instance_name,
+                &e.display_name,
+                entry.icons.get(&e.display_name),
+            );
+            ModFileInfo {
+                filename: e.filename.clone().into(),
+                display_name: e.display_name.clone().into(),
+                enabled: e.enabled,
+                icon,
+                duplicate: e.duplicate,
+                dup_total: e.dup_total,
+            }
+        })
+        .collect()
+}
+
 // Alle Dateien im mods-Ordner, ungefiltert. Erkennt außerdem doppelte Mods: gleiche Projekt-ID
 // (aus mods-list.json) bei mehr als einer aktiven Datei. Mods, die dort nicht stehen, werden
 // noch nicht erkannt: die Erkennung ist nur so zuverlässig wie die mods-list.json.
+#[hotpath::measure]
 fn list_mod_files_all(instance_dir: &Path) -> Vec<ModFileEntry> {
     let mods_dir = instance_dir.join("mods");
     let Ok(entries) = fs::read_dir(&mods_dir) else { return Vec::new(); };
@@ -1394,7 +1555,7 @@ fn list_mod_files_all(instance_dir: &Path) -> Vec<ModFileEntry> {
             let enabled = !filename.ends_with(".disabled");
             let display_name = filename.strip_suffix(".disabled").unwrap_or(&filename).to_string();
             let icon_path = icons.get(&display_name).cloned();
-            ModFileEntry { filename, display_name, enabled, icon_path, duplicate: false }
+            ModFileEntry { filename, display_name, enabled, icon_path, duplicate: false, dup_total: 0 }
         })
         .collect();
 
@@ -1411,11 +1572,16 @@ fn list_mod_files_all(instance_dir: &Path) -> Vec<ModFileEntry> {
         }
     }
 
+    // Gesamtzahl der doppelten Dateien in JEDE Zeile schreiben: so kann Slint ohne Zusatz-Property prüfen, ob es welche gibt.
+    let dup_count = result.iter().filter(|e| e.duplicate).count() as i32;
+    for e in result.iter_mut() { e.dup_total = dup_count; }
+
     result.sort_by(|a, b| a.display_name.cmp(&b.display_name));
     result
 }
 
 // Die Liste für die UI: zusätzlich nach dem Suchfeld gefiltert (nur Dateiname, keine weiteren Filter).
+#[hotpath::measure]
 fn list_mod_files_raw(instance_dir: &Path) -> Vec<ModFileEntry> {
     let mut all = list_mod_files_all(instance_dir);
     let filter = mod_filter().lock().unwrap().to_lowercase();
@@ -1427,6 +1593,7 @@ fn list_mod_files_raw(instance_dir: &Path) -> Vec<ModFileEntry> {
 
 // Baut aus einem ModFileEntry (reine Daten) das Slint-ModFileInfo inkl.
 // geladenem Icon. MUSS auf dem UI-Thread aufgerufen werden.
+
 fn build_mod_file_info(entry: ModFileEntry) -> ModFileInfo {
     let icon_path = entry.icon_path.map(PathBuf::from);
     ModFileInfo {
@@ -1435,10 +1602,12 @@ fn build_mod_file_info(entry: ModFileEntry) -> ModFileInfo {
         enabled: entry.enabled,
         icon: load_icon(&icon_path),
         duplicate: entry.duplicate,
+        dup_total: entry.dup_total,
     }
 }
 
 // Aktiviert/deaktiviert einen Mod durch Umbenennen (".disabled"-Suffix an-/abhängen).
+
 fn toggle_mod_file(instance_dir: &Path, filename: &str) {
     let mods_dir = instance_dir.join("mods");
     let old_path = mods_dir.join(filename);
@@ -1463,6 +1632,7 @@ fn remove_mod_file(instance_dir: &Path, filename: &str) {
 
 // mod_icons.json: Zuordnung Mod-Dateiname (ohne ".disabled") -> Pfad zur
 // gecachten Icon-Datei, liegt direkt im Instanz-Ordner.
+
 fn load_mod_icons(instance_dir: &Path) -> HashMap<String, String> {
     let path = instance_dir.join("mod_icons.json");
     let Ok(file) = File::open(&path) else {
@@ -1481,6 +1651,7 @@ fn save_mod_icons(instance_dir: &Path, icons: &HashMap<String, String>) {
 }
 
 // Lädt die instance_overrides.json einer Instanz, oder Defaults falls noch keine existiert.
+
 fn load_instance_overrides(instance_dir: &Path) -> InstanceOverrides {
     let path = instance_dir.join("instance_overrides.json");
     let Ok(file) = File::open(&path) else {
@@ -1499,6 +1670,7 @@ fn save_instance_overrides(instance_dir: &Path, overrides: &InstanceOverrides) {
 
 // Lädt accounts.json (Offline- + Microsoft-Accounts), oder Defaults falls
 // noch keine existiert.
+
 fn load_accounts(launcher_dir: &Path) -> AccountsData {
     let path = launcher_dir.join("accounts.json");
     let Ok(file) = File::open(&path) else {
@@ -1525,6 +1697,7 @@ fn save_accounts(launcher_dir: &Path, data: &AccountsData) {
 }
 
 // Baut aus AccountsData die Slint-Liste inkl. "selected"-Markierung.
+
 fn accounts_to_ui_model(data: &AccountsData) -> Vec<AccountInfo> {
     data.accounts
         .iter()
@@ -1539,6 +1712,7 @@ fn accounts_to_ui_model(data: &AccountsData) -> Vec<AccountInfo> {
 
 // Öffnet eine URL im Standardbrowser (ohne extra Crate). Unter Windows bewusst über rundll32,
 // weil "cmd /C start" das "&" in der URL als Befehlstrenner behandeln würde.
+
 fn open_in_browser(url: &str) {
     #[cfg(target_os = "windows")]
     let result = std::process::Command::new("rundll32")
@@ -1558,6 +1732,7 @@ fn open_in_browser(url: &str) {
 
 // Öffnet einen Ordner im Dateimanager des Systems (gleiches Prinzip wie open_in_browser).
 // spawn() wartet nicht auf den Dateimanager, der Launcher bleibt also bedienbar.
+
 fn open_in_file_manager(path: &Path) {
     #[cfg(target_os = "windows")]
     let result = std::process::Command::new("explorer").arg(path).spawn();
@@ -1575,6 +1750,7 @@ fn open_in_file_manager(path: &Path) {
 
 // Holt den Auth-Code aus dem, was der Nutzer eingefügt hat: entweder die komplette Adresse der
 // leeren Seite (".../oauth20_desktop.srf?code=XYZ&lc=1031") oder nur der Code selbst.
+
 fn extract_auth_code(input: &str) -> Option<String> {
     let input = input.trim();
     if input.is_empty() {
@@ -1599,6 +1775,7 @@ fn extract_auth_code(input: &str) -> Option<String> {
 // Baut aus einem gespeicherten Microsoft-Account die AuthMethod für lyceris.
 // Ist der Zugriffstoken abgelaufen, wird er per refresh_token erneuert und der
 // Account in accounts.json aktualisiert.
+
 async fn microsoft_auth_for(launcher_dir: &Path, mut acc: AccountEntry) -> Result<lyceris::AuthMethod, String> {
     if !lyceris::auth::microsoft::validate(acc.token_exp.unwrap_or(0)) {
         let refresh_token = acc
@@ -1682,6 +1859,7 @@ async fn latest_loader_version(kind: &str, mc: &str) -> Option<String> {
 // 1.21.1 -> "21.1.", 1.21 -> "21.0."
 // Ab Minecraft 26.x (neues Jahres-Schema ohne führendes "1.") wird der komplette
 // mc-String 1:1 als Prefix übernommen, siehe match-Zweige unten.
+
 fn neoforge_prefix(mc: &str) -> Option<String> {
     let parts: Vec<&str> = mc.split('.').collect();
 
@@ -1711,6 +1889,7 @@ fn make_loader(kind: &str, version: String) -> Option<Box<dyn Loader>> {
 // Bestimmt aus Modrinths "loaders"-Feld (z.B. ["fabric"] oder ["forge","neoforge"])
 // welchen unserer bekannten Loader-Kinds wir nehmen. Erster Treffer gewinnt.
 // Findet Modrinth keinen bekannten Loader (z.B. reines Datapack/Resourcepack), "none".
+
 fn pick_loader_kind(modrinth_loaders: &[String]) -> String {
     let known = ["fabric", "forge", "neoforge", "quilt"];
     for loader in modrinth_loaders {
@@ -1724,6 +1903,7 @@ fn pick_loader_kind(modrinth_loaders: &[String]) -> String {
 
 // Patcht die Forge version.json im Cache, um minecraftArguments zu arguments zu konvertieren.
 // Forge < 1.13 verwendet minecraftArguments (String), aber lyceris erwartet arguments (JSON-Objekt).
+
 fn patch_forge_version_json(launcher_dir: &Path, mc_version: &str, loader_version: &str) {
     let version_json_path = launcher_dir
         .join("shared")
@@ -1778,6 +1958,7 @@ fn patch_forge_version_json(launcher_dir: &Path, mc_version: &str, loader_versio
 // findet die (obfuskierten) Minecraft-Klassen nicht.
 // Ist idempotent: steht "--tweakClass" schon drin, passiert nichts. Bei modernem Forge
 // (JSON mit "arguments" statt "minecraftArguments") tut die Funktion ebenfalls nichts.
+
 fn patch_forge_launch_args(launcher_dir: &Path, mc_version: &str, loader_version: &str) {
     let id = format!("{}-{}", mc_version, loader_version);
 
@@ -1833,83 +2014,94 @@ fn patch_forge_launch_args(launcher_dir: &Path, mc_version: &str, loader_version
     }
 }
 
+#[hotpath::measure]
 async fn install_cf_modpack(
     instance_dir: &PathBuf,
     zip_bytes: Vec<u8>,
     ui_handle: &Weak<AppWindow>,
 ) -> Result<(String, String), String> {
-    let cursor = Cursor::new(zip_bytes);
-    let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("Ungültige Zip-Datei: {e}"))?;
+    let dir = instance_dir.clone();
+    let ui_for_progress = ui_handle.clone();
 
-    // 1. manifest.json lesen (in einem Block, um den Borrow von `archive` sofort zu beenden)
-    let manifest: CfManifest = {
-        let mut manifest_file = archive.by_name("manifest.json").map_err(|_| "Kein manifest.json gefunden. Ist das ein CF-Modpack?".to_string())?;
-        let mut manifest_str = String::new();
-        manifest_file.read_to_string(&mut manifest_str).map_err(|e| format!("Manifest Lesefehler: {e}"))?;
-        serde_json::from_str(&manifest_str).map_err(|e| format!("Manifest Parse Fehler: {e}"))?
-    }; // <-- Hier endet der Block, `manifest_file` wird gedroppt und gibt `archive` frei!
+    let (mc_version, loader, cf_files) = tokio::task::spawn_blocking(
+        move || -> Result<(String, String, Vec<CfManifestFile>), String> {
+            let cursor = Cursor::new(zip_bytes);
+            let mut archive = zip::ZipArchive::new(cursor)
+                .map_err(|e| format!("Ungültige Zip-Datei: {e}"))?;
 
-    let mc_version = manifest.minecraft.version.clone();
-    // WICHTIG: Die komplette ID behalten (z.B. "forge-14.23.5.2860"), damit lyceris die richtige Version findet!
-    let loader = manifest.minecraft.modLoaders.first()
-        .map(|l| l.id.clone()) 
-        .unwrap_or_else(|| "none".to_string());
-    
-    // 2. Overrides entpacken
-    report_progress(ui_handle, "Entpacke CurseForge Overrides...".to_string());
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| format!("Zip-Fehler: {e}"))?;
-        let name = entry.name().to_string();
-        if let Some(rel_path) = name.strip_prefix("overrides/") {
-            if rel_path.is_empty() { continue; }
-            let out_path = instance_dir.join(rel_path);
-            if entry.is_dir() {
-                fs::create_dir_all(&out_path).ok();
-            } else {
-                if let Some(parent) = out_path.parent() { fs::create_dir_all(parent).ok(); }
-                let mut out_file = File::create(&out_path).map_err(|e| format!("Datei erstellen fehlgeschlagen: {e}"))?;
-                std::io::copy(&mut entry, &mut out_file).ok();
+            let manifest: CfManifest = {
+                let mut mf = archive.by_name("manifest.json")
+                    .map_err(|_| "Kein manifest.json gefunden. Ist das ein CF-Modpack?".to_string())?;
+                let mut s = String::new();
+                mf.read_to_string(&mut s).map_err(|e| format!("Manifest Lesefehler: {e}"))?;
+                serde_json::from_str(&s).map_err(|e| format!("Manifest Parse Fehler: {e}"))?
+            };
+
+            let mc_version = manifest.minecraft.version.clone();
+            let loader = manifest.minecraft.modLoaders.first()
+                .map(|l| l.id.clone())
+                .unwrap_or_else(|| "none".to_string());
+            let files = manifest.files;
+
+            let _ = ui_for_progress.upgrade_in_event_loop(|ui| {
+                ui.set_install_popup_status("Entpacke CurseForge Overrides...".into());
+            });
+
+            for i in 0..archive.len() {
+                let mut entry = archive.by_index(i).map_err(|e| format!("Zip-Fehler: {e}"))?;
+                let name = entry.name().to_string();
+                if let Some(rel_path) = name.strip_prefix("overrides/") {
+                    if rel_path.is_empty() { continue; }
+                    let out_path = dir.join(rel_path);
+                    if entry.is_dir() {
+                        fs::create_dir_all(&out_path).ok();
+                    } else {
+                        if let Some(parent) = out_path.parent() { fs::create_dir_all(parent).ok(); }
+                        let mut out_file = File::create(&out_path)
+                            .map_err(|e| format!("Datei erstellen: {e}"))?;
+                        std::io::copy(&mut entry, &mut out_file).ok();
+                    }
+                }
             }
+
+            Ok((mc_version, loader, files))
         }
-    }
+    )
+    .await
+    .map_err(|e| format!("Interner Fehler: {e}"))??;
 
-    // 2.5. Stelle sicher, dass der mods-Ordner existiert (auch wenn das Manifest keine Downloads hat)
     let mods_dir = instance_dir.join("mods");
-    fs::create_dir_all(&mods_dir).map_err(|e| format!("Konnte mods-Ordner nicht anlegen: {e}"))?;
+    fs::create_dir_all(&mods_dir).map_err(|e| format!("mods-Ordner anlegen: {e}"))?;
 
-    // 3. Mods aus dem Manifest herunterladen und mods-list.json erstellen
-    let total = manifest.files.len();
+    let total = cf_files.len();
     let mut mods_list: Vec<ModListEntry> = Vec::new();
 
-    for (i, file) in manifest.files.iter().enumerate() {
+    for (i, file) in cf_files.iter().enumerate() {
         report_progress(ui_handle, format!("Lade Mod {}/{} herunter...", i + 1, total));
         match download_cf_file(file.fileID).await {
             Ok((filename, bytes)) => {
-                let mods_dir = instance_dir.join("mods");
-                fs::create_dir_all(&mods_dir).ok();
-                fs::write(mods_dir.join(&filename), &bytes).map_err(|e| format!("Mod speichern fehlgeschlagen: {e}"))?;
-                
-                // NEU: Zur Liste hinzufügen
+                fs::write(mods_dir.join(&filename), &bytes)
+                    .map_err(|e| format!("Mod speichern fehlgeschlagen: {e}"))?;
                 mods_list.push(ModListEntry {
                     filename: filename.clone(),
                     project_id: file.projectID.to_string(),
                 });
             }
             Err(e) => {
-                println!("⚠️ Mod-Download übersprungen (Projekt-ID: {}, Datei-ID: {}): {}", file.projectID, file.fileID, e);
+                println!("⚠️ Mod-Download übersprungen (Projekt-ID: {}, Datei-ID: {}): {}",
+                    file.projectID, file.fileID, e);
             }
         }
     }
-    
-    // NEU: mods-list.json für diese Instanz speichern
-    save_mods_list(instance_dir, &mods_list);
 
+    save_mods_list(instance_dir, &mods_list);
     Ok((mc_version, loader))
 }
 
 // Nimmt den gestarteten Minecraft-Prozess und spiegelt dessen Ausgabe live ins Terminal.
 // stdout und stderr werden jeweils in einem eigenen Task gelesen, damit keiner den
 // anderen blockiert. Danach wartet die Funktion, bis das Spiel beendet wird.
+
 async fn stream_minecraft_log(mut child: tokio::process::Child) {
     // take() holt den Pipe-Handle aus dem Child heraus (bleibt None, falls lyceris
     // die Ausgabe nicht umleitet, dann erbt der Prozess das Terminal ohnehin).
@@ -1960,6 +2152,7 @@ type RunningMap = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>;
 
 // Baut die Liste für die untere Leiste neu auf. Läuft über den Event-Loop, weil
 // Slint-Modelle nur im UI-Thread angefasst werden dürfen.
+
 fn refresh_running_ui(ui_handle: &Weak<AppWindow>, running: &RunningMap) {
     let mut names: Vec<String> = running.lock().unwrap().keys().cloned().collect();
     names.sort();
@@ -1981,7 +2174,10 @@ async fn run_and_track(
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     running.lock().unwrap().insert(name.clone(), tx);
     refresh_running_ui(&ui_handle, &running);
-    let started = std::time::Instant::now(); // Start der Spielzeit-Messung
+    let started = std::time::Instant::now();
+
+    // NEU: Flag setzen, damit parallel_limit() sich drosselt
+    MC_RUNNING.store(true, AtomicOrdering::Relaxed);
 
     tokio::select! {
         result = child.wait() => match result {
@@ -1994,10 +2190,10 @@ async fn run_and_track(
         }
     }
 
-    // Spielzeit speichern: egal ob normal beendet, abgestürzt oder per Force Stop.
-    // (Stirbt der Launcher selbst, geht nur die laufende Session verloren.)
+    // NEU: Flag wieder runter
+    MC_RUNNING.store(false, AtomicOrdering::Relaxed);
+
     add_playtime_secs(&launcher_dir().join("instances").join(&name), started.elapsed().as_secs());
-    // playtime_tick erhöhen -> Kachel und Detailansicht berechnen den Text neu.
     let _ = ui_handle.upgrade_in_event_loop(|ui| { ui.set_playtime_tick(ui.get_playtime_tick() + 1); });
 
     running.lock().unwrap().remove(&name);
@@ -2055,6 +2251,7 @@ fn save_misc(instance_dir: &Path, misc: &InstanceMisc) {
 }
 
 // Kurzform für den Launcher-Ordner (die neuen Teile nutzen ihn oft).
+
 fn launcher_dir() -> PathBuf {
     dirs::data_local_dir().expect("kein Local Data Dir").join("srusm")
 }
@@ -2090,6 +2287,7 @@ fn format_playtime(secs: u64) -> String {
 // ---- Mod-Suchfeld: der Filtertext liegt global, damit ALLE Stellen, die die Mod-Liste neu
 // aufbauen (Toggle, Entfernen, Add-Mod, ...), automatisch gefiltert werden, ohne geändert zu werden.
 static MOD_FILTER: OnceLock<Mutex<String>> = OnceLock::new();
+
 fn mod_filter() -> &'static Mutex<String> {
     MOD_FILTER.get_or_init(|| Mutex::new(String::new()))
 }
@@ -2097,6 +2295,7 @@ fn mod_filter() -> &'static Mutex<String> {
 // ---- Java-/Minecraft-Hilfen ----
 // Grobe Zuordnung Minecraft-Version -> Java-Hauptversion, die lyceris/Mojang-Runtime nutzt.
 // Das neue Jahres-Schema (26.x) ist geraten (vermutlich Java 25), genau weiß ich es nicht.
+
 fn java_major_for(mc: &str) -> u32 {
     let parts: Vec<u32> = mc.split('.').filter_map(|p| p.parse().ok()).collect();
     match parts.as_slice() {
@@ -2112,6 +2311,7 @@ fn java_major_for(mc: &str) -> u32 {
 }
 
 // Quick Play (--quickPlayMultiplayer / --quickPlaySingleplayer) gibt es ab Minecraft 1.20.
+
 fn supports_quick_play(mc: &str) -> bool {
     let parts: Vec<u32> = mc.split('.').filter_map(|p| p.parse().ok()).collect();
     match parts.as_slice() { [1, minor, ..] => *minor >= 20, _ => true }
@@ -2175,6 +2375,7 @@ fn jvm_preset_flags(id: &str, java_major: u32) -> Vec<String> {
 
 // Auto-Vorschlag: geht bekannte Fälle von oben nach unten durch; der erste passende gewinnt.
 // Liefert (Preset-id, Begründungstext).
+
 fn suggest_jvm_preset(java_major: u32, mods: usize, ram_mb: i32, cores: usize) -> (&'static str, String) {
     if ram_mb < 3072 {
         return ("none", format!("Vorschlag: Standard. Nur {ram_mb} MB RAM sind zugewiesen, bei so wenig Speicher bringen GC-Flags kaum etwas. Erhöhe lieber zuerst den RAM."));
@@ -2198,6 +2399,7 @@ fn suggest_jvm_preset(java_major: u32, mods: usize, ram_mb: i32, cores: usize) -
 }
 
 // ---- Wrapper-Programme (id, Anzeigename, Programm im PATH, Hinweis) ----
+
 fn wrapper_defs() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
     if cfg!(target_os = "linux") {
         vec![
@@ -2232,6 +2434,7 @@ fn wrapper_warning(enabled: &[String]) -> String {
 
 // ---- Was beim Spielstart an lyceris weitergegeben werden soll ----
 // JVM-Argumente: System-GLFW (Linux), Preset-Flags, freie Argumente. Reihenfolge = Priorität.
+
 fn collect_jvm_args(misc: &InstanceMisc, java_major: u32) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     #[cfg(target_os = "linux")]
@@ -2248,6 +2451,7 @@ fn collect_jvm_args(misc: &InstanceMisc, java_major: u32) -> Vec<String> {
 }
 
 // Spiel-Argumente: Quick Play (nur ab 1.20). Der Server hat Vorrang vor der Welt.
+
 fn collect_game_args(misc: &InstanceMisc, mc: &str) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     if misc.quick_enabled && supports_quick_play(mc) {
@@ -2264,6 +2468,7 @@ fn collect_game_args(misc: &InstanceMisc, mc: &str) -> Vec<String> {
 
 // ---- Daten -> UI ----
 // Nur die Listen (Env + Wrapper): wird nach Hinzufügen/Entfernen genutzt, ohne ungespeicherte Textfelder zu überschreiben.
+
 fn push_misc_lists(ui: &AppWindow, instance_name: &str) {
     let misc = load_misc(&launcher_dir().join("instances").join(instance_name));
 
@@ -2284,6 +2489,7 @@ fn push_misc_lists(ui: &AppWindow, instance_name: &str) {
 }
 
 // Alles fürs Misc-Popup (wird beim Öffnen aufgerufen).
+
 fn push_misc_to_ui(ui: &AppWindow, instance_name: &str) {
     let launcher = launcher_dir();
     let instance_dir = launcher.join("instances").join(instance_name);
@@ -2321,6 +2527,7 @@ fn push_misc_to_ui(ui: &AppWindow, instance_name: &str) {
 }
 
 // Quick-Connect-Zeile der Detailansicht.
+
 fn push_quick_to_ui(ui: &AppWindow, instance_name: &str) {
     let instance_dir = launcher_dir().join("instances").join(instance_name);
     let misc = load_misc(&instance_dir);
@@ -2329,8 +2536,449 @@ fn push_quick_to_ui(ui: &AppWindow, instance_name: &str) {
     ui.set_detail_quick_server(misc.quick_server.into());
     ui.set_detail_quick_world(misc.quick_world.into());
     ui.set_detail_quick_supported(supports_quick_play(&mc));
+    ui.set_misc_auto_fix_dupes(misc.auto_fix_duplicates);
 }
 
+// ===================== Block 3: Manage Instanz =====================
+
+fn is_running(running: &RunningMap, name: &str) -> bool {
+    running.lock().unwrap().contains_key(name)
+}
+
+// Neuer Instanzname: Sonderzeichen entfernen, Punkte am Rand weg, leer = ungültig.
+
+fn clean_new_name(raw: &str) -> Option<String> {
+    let s = sanitize_dir_name(raw.trim());
+    let s = s.trim_matches('.').trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+fn save_instance_config(instance_dir: &Path, cfg: &ModpackJsonData) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    fs::write(instance_dir.join("instance.json"), json).map_err(|e| format!("instance.json schreiben: {e}"))
+}
+
+// Kachel für die Instanzliste aus der instance.json. MUSS im UI-Thread laufen (lädt ein slint::Image).
+
+fn tile_from_config(cfg: &ModpackJsonData) -> ModpackInfo {
+    let icon_path = cfg.icon_path.clone().map(PathBuf::from);
+    ModpackInfo {
+        name: cfg.name.clone().into(),
+        minecraft_version: cfg.minecraft_version.clone().into(),
+        loader: cfg.loader.clone().into(),
+        ram_mb: cfg.ram_mb,
+        icon: load_icon(&icon_path),
+    }
+}
+
+// Zugriff auf das VecModel der Instanz-Kacheln (gleiche Downcast-Methode wie beim Install).
+
+fn with_packs_model(ui: &AppWindow, f: impl FnOnce(&VecModel<ModpackInfo>)) {
+    let model = ui.get_packs();
+    if let Some(vm) = model.as_any().downcast_ref::<VecModel<ModpackInfo>>() {
+        f(vm);
+    }
+}
+
+fn find_tile_row(vm: &VecModel<ModpackInfo>, name: &str) -> Option<usize> {
+    (0..vm.row_count()).find(|&i| vm.row_data(i).map(|r| r.name.as_str() == name).unwrap_or(false))
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let (from, to) = (entry.path(), dst.join(entry.file_name()));
+        if entry.file_type()?.is_dir() { copy_dir_recursive(&from, &to)?; } else { fs::copy(&from, &to)?; }
+    }
+    Ok(())
+}
+
+// Packt die Instanz als .zip (ohne logs/ und crash-reports/). Gibt die unkomprimierte Größe zurück.
+
+fn export_instance_zip(instance_dir: &Path, out_path: &Path) -> Result<u64, String> {
+    let file = File::create(out_path).map_err(|e| format!("Zip anlegen: {e}"))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let base_opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut stack = vec![instance_dir.to_path_buf()];
+    let mut total = 0u64;
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            let rel = path.strip_prefix(instance_dir).map_err(|e| e.to_string())?;
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            if path.is_dir() {
+                if rel_str == "logs" || rel_str == "crash-reports" { continue; }
+                stack.push(path);
+            } else {
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                // Dateien über 4 GiB brauchen das Zip64-Flag
+                let opts = if size > 0xFFFF_FFFF { base_opts.large_file(true) } else { base_opts };
+                zip.start_file(rel_str, opts).map_err(|e| e.to_string())?;
+                let mut f = File::open(&path).map_err(|e| e.to_string())?;
+                std::io::copy(&mut f, &mut zip).map_err(|e| e.to_string())?;
+                total += size;
+            }
+        }
+    }
+    zip.finish().map_err(|e| e.to_string())?;
+    Ok(total)
+}
+
+// ---- Verfügbare Loader-Versionen (für die Auswahlliste) ----
+
+async fn list_loader_versions(kind: &str, mc: &str) -> Option<Vec<String>> {
+    match kind {
+        "fabric" => {
+            let list: Vec<LoaderEntry> = fetch("https://meta.fabricmc.net/v2/versions/loader".to_string(), None).await.ok()?;
+            Some(list.into_iter().filter(|e| e.stable).map(|e| e.version).take(30).collect())
+        }
+        "quilt" => {
+            let list: Vec<LoaderEntry> = fetch("https://meta.quiltmc.org/v3/versions/loader".to_string(), None).await.ok()?;
+            Some(list.into_iter().filter(|e| !e.version.contains('-')).map(|e| e.version).take(30).collect())
+        }
+        "forge" => {
+            // Nur "recommended" und "latest" aus der Promotions-Liste (die volle Liste braucht einen anderen Endpunkt).
+            #[derive(Deserialize)]
+            struct Promos { promos: HashMap<String, String> }
+            let p: Promos = fetch("https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json".to_string(), None).await.ok()?;
+            let mut v: Vec<String> = Vec::new();
+            for key in [format!("{mc}-recommended"), format!("{mc}-latest")] {
+                if let Some(x) = p.promos.get(&key) { if !v.contains(x) { v.push(x.clone()); } }
+            }
+            Some(v)
+        }
+        "neoforge" => {
+            #[derive(Deserialize)]
+            struct Versions { versions: Vec<String> }
+            let v: Versions = fetch("https://maven.neoforged.net/api/maven/versions/releases/net/neoforged/neoforge".to_string(), None).await.ok()?;
+            let prefix = neoforge_prefix(mc)?;
+            Some(v.versions.into_iter().filter(|x| x.starts_with(&prefix) && !x.contains('-')).rev().take(40).collect())
+        }
+        _ => None,
+    }
+}
+
+// ---- Loader-Check: liest die Loader-Anforderungen aus den Mod-Jars und testet die Zielversion ----
+use std::cmp::Ordering;
+
+// "0.16.9" -> [0,16,9]. Alles ab '-' oder '+' (Pre-Release) wird abgeschnitten.
+
+fn parse_ver(s: &str) -> Option<Vec<u64>> {
+    let s = s.trim().trim_start_matches('v');
+    let core = s.split(|c: char| c == '-' || c == '+').next()?;
+    if core.is_empty() { return None; }
+    core.split('.').map(|p| p.parse::<u64>().ok()).collect()
+}
+
+fn cmp_ver(a: &[u64], b: &[u64]) -> Ordering {
+    for i in 0..a.len().max(b.len()) {
+        let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+        if x != y { return x.cmp(&y); }
+    }
+    Ordering::Equal
+}
+
+// Ein Fabric-Vergleich wie ">=0.16.2", "<0.17-", "~0.16", "^1.2", "0.16.x". None = nicht lesbar.
+
+fn fabric_cmp_matches(token: &str, v: &[u64]) -> Option<bool> {
+    let t = token.trim();
+    if t.is_empty() || t == "*" { return Some(true); }
+    let (op, rest) = ["<=", ">=", "<", ">", "=", "~", "^"].iter()
+        .find_map(|o| t.strip_prefix(*o).map(|r| (*o, r.trim())))
+        .unwrap_or(("=", t));
+    if rest.chars().any(|c| matches!(c, 'x' | 'X' | '*')) {
+        if op != "=" { return None; }
+        let prefix: Vec<u64> = rest.split('.').take_while(|p| !matches!(*p, "x" | "X" | "*")).filter_map(|p| p.parse().ok()).collect();
+        return Some(prefix.iter().enumerate().all(|(i, p)| v.get(i).copied().unwrap_or(0) == *p));
+    }
+    let r = parse_ver(rest)?;
+    Some(match op {
+        ">=" => cmp_ver(v, &r) != Ordering::Less,
+        "<=" => cmp_ver(v, &r) != Ordering::Greater,
+        ">" => cmp_ver(v, &r) == Ordering::Greater,
+        "<" => cmp_ver(v, &r) == Ordering::Less,
+        "=" => cmp_ver(v, &r) == Ordering::Equal,
+        "~" => {
+            let mut up = r.clone();
+            if up.len() >= 2 { up.truncate(2); up[1] += 1; } else { up[0] += 1; }
+            cmp_ver(v, &r) != Ordering::Less && cmp_ver(v, &up) == Ordering::Less
+        }
+        "^" => cmp_ver(v, &r) != Ordering::Less && cmp_ver(v, &[r[0] + 1]) == Ordering::Less,
+        _ => return None,
+    })
+}
+
+// "A B || C": Gruppen mit "||" = ODER, Leerzeichen = UND.
+
+fn fabric_pred_matches(pred: &str, v: &[u64]) -> Option<bool> {
+    let mut unknown_seen = false;
+    for group in pred.split("||") {
+        let (mut ok, mut unknown) = (true, false);
+        for tok in group.split_whitespace() {
+            match fabric_cmp_matches(tok, v) { Some(true) => {}, Some(false) => ok = false, None => unknown = true }
+        }
+        if unknown { unknown_seen = true; continue; }
+        if ok { return Some(true); }
+    }
+    if unknown_seen { None } else { Some(false) }
+}
+
+// Maven-Bereich der Forge-Welt: "[47,)", "[47.1.0,48)", "[47]", "47" (= Mindestversion).
+
+fn maven_range_matches(range: &str, v: &[u64]) -> Option<bool> {
+    let r = range.trim();
+    if r.is_empty() { return Some(true); }
+    let first = r.chars().next()?;
+    if first != '[' && first != '(' {
+        return Some(cmp_ver(v, &parse_ver(r)?) != Ordering::Less);
+    }
+    if r.len() < 2 || !(r.ends_with(']') || r.ends_with(')')) { return None; }
+    let (lo_incl, hi_incl) = (first == '[', r.ends_with(']'));
+    let inner = &r[1..r.len() - 1];
+    if inner.contains(|c| matches!(c, '[' | ']' | '(' | ')')) { return None; } // mehrere Bereiche: nicht unterstützt
+    match inner.split_once(',') {
+        None => Some(cmp_ver(v, &parse_ver(inner)?) == Ordering::Equal),
+        Some((lo, hi)) => {
+            let mut ok = true;
+            if !lo.trim().is_empty() {
+                let c = cmp_ver(v, &parse_ver(lo)?);
+                ok &= if lo_incl { c != Ordering::Less } else { c == Ordering::Greater };
+            }
+            if !hi.trim().is_empty() {
+                let c = cmp_ver(v, &parse_ver(hi)?);
+                ok &= if hi_incl { c != Ordering::Greater } else { c == Ordering::Less };
+            }
+            Some(ok)
+        }
+    }
+}
+
+fn toml_kv(line: &str) -> Option<(String, String)> {
+    let (k, v) = line.split_once('=')?;
+    let v = v.trim();
+    let val = if let Some(rest) = v.strip_prefix('"') {
+        rest.split('"').next()?.to_string()
+    } else {
+        v.split(|c: char| c.is_whitespace() || c == '#').next()?.to_string()
+    };
+    Some((k.trim().to_string(), val))
+}
+
+// Grobes Lesen der mods.toml: sammelt die Version-Bereiche der Pflicht-Abhängigkeit auf den Loader
+// ([[dependencies.xyz]] mit modId = "forge"/"neoforge"). Kein vollständiger TOML-Parser.
+
+fn forge_loader_ranges(text: &str, loader_modid: &str) -> Vec<String> {
+    fn flush(in_dep: bool, id: &str, range: &str, required: bool, want: &str, out: &mut Vec<String>) {
+        if in_dep && id == want && required && !range.is_empty() { out.push(range.to_string()); }
+    }
+    let mut out = Vec::new();
+    let (mut in_dep, mut id, mut range, mut required) = (false, String::new(), String::new(), true);
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with("[[dependencies.") {
+            flush(in_dep, &id, &range, required, loader_modid, &mut out);
+            in_dep = true; id.clear(); range.clear(); required = true;
+            continue;
+        }
+        if l.starts_with('[') {
+            flush(in_dep, &id, &range, required, loader_modid, &mut out);
+            in_dep = false;
+            continue;
+        }
+        if !in_dep { continue; }
+        if let Some((k, val)) = toml_kv(l) {
+            match k.as_str() {
+                "modId" => id = val,
+                "versionRange" => range = val,
+                "mandatory" => required = val != "false",
+                "type" => required = val == "required",
+                _ => {}
+            }
+        }
+    }
+    flush(in_dep, &id, &range, required, loader_modid, &mut out);
+    out
+}
+
+fn read_zip_text(zip: &mut zip::ZipArchive<File>, name: &str) -> Option<String> {
+    let mut f = zip.by_name(name).ok()?;
+    let mut s = String::new();
+    f.read_to_string(&mut s).ok()?;
+    Some(s)
+}
+
+struct LoaderCheck {
+    supported: bool,        // false = für diesen Loader kann nicht geprüft werden
+    checked: usize,         // Mods mit lesbarer Loader-Anforderung
+    unchecked: usize,       // Mods, deren Anforderung ich nicht auswerten konnte
+    conflicts: Vec<String>, // Mods, die die Zielversion nicht erlauben
+}
+
+
+fn check_loader_change(instance_dir: &Path, kind: &str, target: &str) -> LoaderCheck {
+    let mut res = LoaderCheck { supported: matches!(kind, "fabric" | "forge" | "neoforge"), checked: 0, unchecked: 0, conflicts: Vec::new() };
+    let Some(tv) = parse_ver(target) else { res.supported = false; return res; };
+    if !res.supported { return res; }
+
+    let Ok(entries) = fs::read_dir(instance_dir.join("mods")) else { return res; };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let fname = entry.file_name().to_string_lossy().to_string();
+        if !fname.ends_with(".jar") { continue; } // deaktivierte Mods (.disabled) zählen nicht
+        let Ok(file) = File::open(entry.path()) else { continue; };
+        let Ok(mut zip) = zip::ZipArchive::new(file) else { continue; };
+
+        // Anforderungen (OR-Liste) und Anzeigename je nach Loader lesen
+        let (display, preds): (String, Vec<String>) = if kind == "fabric" {
+            let Some(text) = read_zip_text(&mut zip, "fabric.mod.json") else { continue; };
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else { continue; };
+            let name = json.get("name").and_then(|v| v.as_str()).unwrap_or(&fname).to_string();
+            let preds = match json.get("depends").and_then(|d| d.get("fabricloader")) {
+                Some(serde_json::Value::String(s)) => vec![s.clone()],
+                Some(serde_json::Value::Array(a)) => a.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+                _ => continue, // keine Anforderung an den Loader
+            };
+            (name, preds)
+        } else {
+            let (modid, toml_names): (&str, &[&str]) = if kind == "neoforge" {
+                ("neoforge", &["META-INF/neoforge.mods.toml", "META-INF/mods.toml"])
+            } else {
+                ("forge", &["META-INF/mods.toml"])
+            };
+            let Some(text) = toml_names.iter().find_map(|n| read_zip_text(&mut zip, n)) else { continue; };
+            let ranges = forge_loader_ranges(&text, modid);
+            if ranges.is_empty() { continue; }
+            (fname.clone(), ranges)
+        };
+
+        // Alternativen (ODER): passt eine, ist der Mod in Ordnung.
+        let mut any_true = false;
+        let mut any_unknown = false;
+        for p in &preds {
+            let r = if kind == "fabric" { fabric_pred_matches(p, &tv) } else { maven_range_matches(p, &tv) };
+            match r { Some(true) => any_true = true, Some(false) => {}, None => any_unknown = true }
+        }
+        if any_true { res.checked += 1; }
+        else if any_unknown { res.unchecked += 1; }
+        else {
+            res.checked += 1;
+            res.conflicts.push(format!("{} ({}): verlangt {} {}, Ziel ist {}", display, fname, kind, preds.join(" oder "), target));
+        }
+    }
+    res
+}
+
+// Aus dem Check den Anzeigetext bauen. Rückgabe: (Wechsel erlaubt?, Text).
+fn format_loader_report(check: &LoaderCheck, kind: &str, from: &str, to: &str) -> (bool, String) {
+    if !check.supported {
+        return (true, format!("Hinweis: Für {kind} kann ich die Mod-Anforderungen nicht prüfen. Der Wechsel {from} -> {to} ist ungeprüft; bestätige nur, wenn du sicher bist."));
+    }
+    if check.conflicts.is_empty() {
+        let extra = if check.unchecked > 0 { format!(" {} Mods konnte ich nicht prüfen (Anforderung nicht lesbar).", check.unchecked) } else { String::new() };
+        return (true, format!("OK: {kind} {from} -> {to}. {} Mods geprüft, kein Konflikt gefunden.{extra} Es sind keine Mod-Änderungen nötig.", check.checked));
+    }
+    let mut lines: Vec<String> = check.conflicts.iter().take(8).map(|c| format!("- {c}")).collect();
+    if check.conflicts.len() > 8 { lines.push(format!("... und {} weitere", check.conflicts.len() - 8)); }
+    (false, format!("Nicht möglich: {kind} {to} passt nicht zu {} Mods. Es wurde nichts geändert.\n{}", check.conflicts.len(), lines.join("\n")))
+}
+
+// Startet den Check im Hintergrund (Zip-Lesen blockiert) und schreibt das Ergebnis in die UI.
+// target = None: Zielversion ist die neueste stabile.
+fn start_loader_check(wh: Weak<AppWindow>, hdl: tokio::runtime::Handle, name: String, target: Option<String>) {
+    hdl.spawn(async move {
+        let post = |wh: &Weak<AppWindow>, text: String, pending: String| {
+            let _ = wh.upgrade_in_event_loop(move |ui| {
+                ui.set_manage_loader_report(text.into());
+                ui.set_manage_loader_pending(pending.into());
+            });
+        };
+        let dir = launcher_dir().join("instances").join(&name);
+        let Some(cfg) = load_instance_config(&dir) else { post(&wh, "instance.json fehlt.".into(), String::new()); return; };
+        let (kind, id_ver) = split_loader_id(&cfg.loader);
+        if kind == "none" { post(&wh, "Vanilla-Instanz: kein Loader.".into(), String::new()); return; }
+        let from = cfg.loader_version.clone().or(id_ver).unwrap_or_else(|| "neueste stabile".to_string());
+
+        let to = match target {
+            Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+            Some(_) => { post(&wh, "Bitte zuerst eine Version wählen.".into(), String::new()); return; }
+            None => match latest_loader_version(&kind, &cfg.minecraft_version).await {
+                Some(v) => v,
+                None => { post(&wh, "Neueste Version konnte nicht ermittelt werden.".into(), String::new()); return; }
+            },
+        };
+        if to == from { post(&wh, format!("Die Instanz nutzt schon {kind} {to}."), String::new()); return; }
+
+        let (d2, k2, t2) = (dir.clone(), kind.clone(), to.clone());
+        let Ok(check) = tokio::task::spawn_blocking(move || check_loader_change(&d2, &k2, &t2)).await else {
+            post(&wh, "Interner Fehler beim Prüfen.".into(), String::new());
+            return;
+        };
+        let (ok, text) = format_loader_report(&check, &kind, &from, &to);
+        post(&wh, text, if ok { to } else { String::new() });
+    });
+}
+
+// ===================== Block 4: Doppelte Mods + mods-list.json =====================
+
+// Vorschläge zum Beheben: pro Projekt mit mehreren aktiven Dateien wird die NEUESTE Datei behalten (Änderungsdatum),
+// die anderen werden zum Deaktivieren vorgeschlagen. Deaktiviert (.disabled) statt gelöscht, damit es umkehrbar bleibt.
+// Rückgabe: (Dateiname, Anzeigetext).
+fn duplicate_proposals(instance_dir: &Path) -> Vec<(String, String)> {
+    let mods_dir = instance_dir.join("mods");
+    let pid_by_file: HashMap<String, String> = load_mods_list(instance_dir)
+        .into_iter().map(|e| (e.filename, e.project_id)).collect();
+
+    let mut groups: HashMap<String, Vec<(String, std::time::SystemTime)>> = HashMap::new();
+    for e in list_mod_files_all(instance_dir).into_iter().filter(|e| e.enabled) {
+        if let Some(pid) = pid_by_file.get(&e.display_name) {
+            let mtime = fs::metadata(mods_dir.join(&e.filename)).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            groups.entry(pid.clone()).or_default().push((e.filename, mtime));
+        }
+    }
+
+    let mut out = Vec::new();
+    for (_pid, mut files) in groups {
+        if files.len() < 2 { continue; }
+        files.sort_by(|a, b| b.1.cmp(&a.1)); // neueste zuerst
+        let keep = files[0].0.clone();
+        for (f, _) in files.into_iter().skip(1) {
+            out.push((f.clone(), format!("Deaktivieren: {f}  (behalte {keep}, die neuere Datei)")));
+        }
+    }
+    out.sort();
+    out
+}
+
+// mods-list.json pflegen, OHNE die Einträge aus dem Modpack-Install zu verlieren (die alte Variante
+// hat die Datei aus mod_meta.json neu geschrieben und dabei alle Pack-Mods gelöscht).
+fn mods_list_remove(instance_dir: &Path, filename: &str) {
+    let mut list = load_mods_list(instance_dir);
+    list.retain(|e| e.filename != filename);
+    save_mods_list(instance_dir, &list);
+}
+
+fn mods_list_upsert(instance_dir: &Path, project_id: &str, old_filename: Option<&str>, new_filename: &str) {
+    let mut list = load_mods_list(instance_dir);
+    if let Some(old) = old_filename { list.retain(|e| e.filename != old); }
+    list.retain(|e| e.filename != new_filename);
+    list.push(ModListEntry { filename: new_filename.to_string(), project_id: project_id.to_string() });
+    save_mods_list(instance_dir, &list);
+}
+
+static MC_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Wie viele parallele Aufgaben dürfen wir starten?
+/// Während MC läuft deutlich weniger, um dessen Ressourcen nicht zu stehlen.
+fn parallel_limit(cap: usize) -> usize {
+    if MC_RUNNING.load(AtomicOrdering::Relaxed) {
+        cap.min(2)
+    } else {
+        cap
+    }
+}
+
+#[hotpath::main]
 fn main() -> Result<(), Box<dyn Error>> {
 
     // NVIDIA-Workaround: wird an den Minecraft-Prozess vererbt.
@@ -2353,8 +3001,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+    let workers = cores.clamp(2, 4);
+    println!("🖥️  Verwende {} Tokio-Worker ({} logische Kerne erkannt)", workers, cores);
     let rt = Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(workers)
         .enable_all()
         .build()?;
 
@@ -2462,7 +3113,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     ui.set_compat_actions(ModelRc::new(VecModel::from(Vec::<CompatibilityActionUi>::new())));
     ui.set_compat_conflicts(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
 
-    ui.set_debug_log(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+    //ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
 
     // Settings laden (falls schon vorhanden), sonst Defaults nehmen und direkt
     // eine settings.json anlegen, damit's beim nächsten Start schon da ist.
@@ -2487,7 +3138,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     ui.set_open_on_startup(settings.open_on_startup);
     ui.set_show_snapshots(settings.show_snapshots);
     ui.set_items_per_page(settings.items_per_page);
-    ui.set_debug_ui(settings.debug_ui);
+    //ui.set_debug_ui(settings.debug_ui);
 
     // Accounts laden und in die UI schreiben.
     let accounts_data = load_accounts(&launcherDir);
@@ -2509,48 +3160,51 @@ fn main() -> Result<(), Box<dyn Error>> {
         });
     });
 
-    // Search for Installed Instances
-    for instance in fs::read_dir(&launcherDir.join("instances"))? {
-        //if fs::exists(&launcherDir.join("instances/").join(instance).join("instance.json")) {
-        //    modpacktilemodel.push(ModpackInfo { name: "Test...".into() });
-        //}
+    // Search for Installed Instances (async + parallel, damit der UI-Start nicht blockiert)
+    {
+        let scan_ui = ui_handle.clone();
+        let scan_dir = launcherDir.clone();
+        let scan_handle = handle.clone();
+        scan_handle.spawn(async move {
+            // Verzeichnisse einlesen (blocking, kurz)
+            let dirs: Vec<PathBuf> = match tokio::task::spawn_blocking({
+                let base = scan_dir.clone();
+                move || -> Vec<PathBuf> {
+                    let mut out = Vec::new();
+                    let Ok(rd) = fs::read_dir(base.join("instances")) else { return out; };
+                    for entry in rd.flatten() {
+                        let p = entry.path();
+                        if p.is_dir() && p.join("instance.json").is_file() {
+                            out.push(p);
+                        }
+                    }
+                    out
+                }
+            }).await { Ok(v) => v, Err(_) => Vec::new() };
 
-        let Ok(instance) = instance else {
-            continue;
-        };
-
-        let path = instance.path();
-
-        if !path.is_dir() {
-            continue;
-        }
-
-        if !path.join("instance.json").is_file() {
-            continue;
-        }
-
-        let Some(modpackname) = path.file_name() else {
-            continue; // Pfad ohne Namen überspringen
-        };
-
-        let file = File::open(&launcherDir.join("instances/").join(&modpackname).join("instance.json")).expect("Error during file Reading of instance.json");
-        let reader = BufReader::new(file);
-        
-        let config: ModpackJsonData = serde_json::from_reader(reader).expect("Error during extracting data out of instance.json");
-
-        // Icon-Pfad (falls vorhanden) klonen bevor die restlichen Felder unten
-        // per .into() verschoben werden, und direkt zu einem slint::Image laden.
-        let icon_path = config.icon_path.clone().map(PathBuf::from);
-
-        modpacktilemodel.push(ModpackInfo {
-            //name: modpackname.to_string_lossy().to_string().into(),
-            name: config.name.into(),
-            minecraft_version: config.minecraft_version.into(),
-            loader: config.loader.into(),
-            ram_mb: config.ram_mb,
-            icon: load_icon(&icon_path),
+            // Parallel parsen, UI-Thread baut die Kacheln (weil Image nicht Send)
+            let limit = parallel_limit(8);
+            let sem = Arc::new(tokio::sync::Semaphore::new(limit));
+            let mut tasks = Vec::with_capacity(dirs.len());
+            for dir in dirs {
+                let sem = sem.clone();
+                tasks.push(tokio::spawn(async move {
+                    let _permit = sem.acquire().await.ok()?;
+                    let cfg: Option<ModpackJsonData> = tokio::task::spawn_blocking(move || -> Option<ModpackJsonData> {
+                        let f = File::open(dir.join("instance.json")).ok()?;
+                        serde_json::from_reader(BufReader::new(f)).ok()
+                    }).await.ok()?;
+                    cfg
+                }));
+            }
+            for t in tasks {
+                if let Ok(Some(cfg)) = t.await {
+                    let _ = scan_ui.upgrade_in_event_loop(move |ui| {
+                        with_packs_model(&ui, |vm| vm.push(tile_from_config(&cfg)));
+                    });
+                }
+            }
         });
-        
     }
 
     ui.on_create_and_run(move |name, version, modloader| {
@@ -2670,7 +3324,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     Ok(auth) => auth,
                     Err(e) => {
                         println!("❌ Microsoft-Anmeldung fehlgeschlagen: {e}");
-                        push_debug_log(&ui_handle, format!("Microsoft-Anmeldung fehlgeschlagen: {e}"));
+                        //push_debug_log(&ui_handle, format!("Microsoft-Anmeldung fehlgeschlagen: {e}"));
                         return;
                     }
                 },
@@ -2828,7 +3482,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             open_on_startup,
             show_snapshots,
             items_per_page,
-            debug_ui,
         };
 
         let launcherDir = dirs::data_local_dir()
@@ -2891,6 +3544,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             });
         });
     });*/
+
     // <-- GEÄNDERT: Sucht jetzt GLEICHZEITIG in Modrinth und CurseForge
     ui.on_browser_search(move |query, _source| {
         let handle = browser_search_handle.clone();
@@ -3009,23 +3663,48 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             println!("📥 Lade {} Icons parallel im Hintergrund...", packs_with_urls.len());
 
-            // PARALLELER Icon-Download
-            let mut handles = Vec::new();
+            // ── Phase A: Downloads parallel ─────────────────────────────────
+            let dl_sem = Arc::new(tokio::sync::Semaphore::new(32));
+            let mut download_tasks = Vec::with_capacity(packs_with_urls.len());
             for pack in &packs_with_urls {
-                let cache_dir = icon_cache_dir.clone();
-                let key = pack.project_id.clone();
                 let url = pack.icon_url.clone();
-                let handle = tokio::spawn(async move {
-                    cache_icon(&cache_dir, &key, &url).await
-                });
-                handles.push(handle);
+                let sem = dl_sem.clone();
+                download_tasks.push(tokio::spawn(async move {
+                    let url = url?;
+                    let _permit = sem.acquire().await.ok()?;
+                    let r: Option<Vec<u8>> = download_bytes(&url).await.ok();
+                    r
+                }));
             }
+            let mut downloaded: Vec<Option<Vec<u8>>> = Vec::with_capacity(download_tasks.len());
+            for t in download_tasks { downloaded.push(t.await.unwrap_or(None)); }
 
-            // Warte auf alle Icon-Downloads
-            let mut icon_paths = Vec::new();
-            for handle in handles {
-                icon_paths.push(handle.await.unwrap_or(None));
+            // ── Phase B: Decode + PNG-Save parallel (blocking, MC-aware) ────
+            let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+            let decode_limit = parallel_limit(cores);
+            let decode_sem = Arc::new(tokio::sync::Semaphore::new(decode_limit));
+            let cache_dir_b = icon_cache_dir.clone();
+            let keys: Vec<String> = packs_with_urls.iter().map(|p| p.project_id.clone()).collect();
+
+            let mut decode_tasks = Vec::with_capacity(downloaded.len());
+            for (key, bytes_opt) in keys.into_iter().zip(downloaded.into_iter()) {
+                let cdir = cache_dir_b.clone();
+                let sem = decode_sem.clone();
+                decode_tasks.push(tokio::spawn(async move {
+                    let bytes = bytes_opt?;
+                    let _permit = sem.acquire().await.ok()?;
+                    let r: Option<(Vec<u8>, u32, u32)> = tokio::task::spawn_blocking(move || -> Option<(Vec<u8>, u32, u32)> {
+                        let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+                        let (w, h) = img.dimensions();
+                        let _ = fs::create_dir_all(&cdir);
+                        let _ = img.save_with_format(cdir.join(format!("{key}.png")), image::ImageFormat::Png);
+                        Some((img.into_raw(), w, h))
+                    }).await.ok()?;
+                    r
+                }));
             }
+            let mut decoded: Vec<Option<(Vec<u8>, u32, u32)>> = Vec::with_capacity(decode_tasks.len());
+            for t in decode_tasks { decoded.push(t.await.unwrap_or(None)); }
 
             println!("✅ Alle Icons geladen, aktualisiere UI...");
 
@@ -3033,17 +3712,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             // Das umgeht den `Send`-Fehler, da `load_icon` und `BrowserPackInfo` 
             // nur im UI-Thread existieren.
             let _ = ui_handle.upgrade_in_event_loop(move |ui| {
-                let items: Vec<BrowserPackInfo> = packs_with_urls.into_iter().zip(icon_paths.into_iter()).map(|(pack, icon_path)| {
+                let items: Vec<BrowserPackInfo> = packs_with_urls.into_iter().zip(decoded.into_iter()).map(|(pack, pixels)| {
+                    let icon = match pixels {
+                        Some((rgba, w, h)) => rgba_to_image(&rgba, w, h),
+                        None => Image::default(),
+                    };
                     BrowserPackInfo {
                         project_id: pack.project_id.into(),
                         name: pack.name.into(),
                         summary: pack.summary.into(),
                         author: pack.author.into(),
-                        icon: load_icon(&icon_path), // <--- Hier ist es erlaubt!
+                        icon,
                         source: pack.source.into(),
                     }
                 }).collect();
-                
                 ui.set_browser_packs(ModelRc::new(VecModel::from(items)));
             });
         });
@@ -3563,7 +4245,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         });
     });
 
-        // Instanz-Details öffnen: liest Mods + Overrides + Icon der Instanz vom
+    // Instanz-Details öffnen: liest Mods + Overrides + Icon der Instanz vom
     // Datenträger und wechselt das Panel. Startet danach einen Hintergrund-Task,
     // um fehlende Mod-Icons aus der mods-list.json nachzuladen.
     ui.on_open_instance_details(move |name| {
@@ -3578,7 +4260,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         ui.set_mod_filter("".into());
         
         // 1. Synchrones Laden der Basisdaten für sofortige UI-Anzeige
-        let mods_raw = list_mod_files_raw(&instance_dir);
         let overrides = load_instance_overrides(&instance_dir);
         let instance_icon_path: Option<PathBuf> = File::open(instance_dir.join("instance.json"))
             .ok()
@@ -3589,7 +4270,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ui.set_detail_instance_name(name.clone());
         ui.set_detail_instance_icon(load_icon(&instance_icon_path));
         ui.set_detail_mod_files(ModelRc::new(VecModel::from(
-            mods_raw.iter().cloned().map(build_mod_file_info).collect::<Vec<_>>(),
+            list_mod_files_cached(name.as_str(), &instance_dir),
         )));
 
         // NEU: Dropdowns und erweiterte Settings befüllen
@@ -3639,6 +4320,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         let bg_launcher_dir = launcherDir.clone();
         let bg_handle = open_details_bg_handle.clone();
 
+        let bg_instance_name = name.to_string();
+
         bg_handle.spawn(async move {
             let cache_dir = bg_launcher_dir.join("icon_cache");
             let mut icons = load_mod_icons(&bg_instance_dir);
@@ -3684,10 +4367,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     println!("✨ {} Icons erfolgreich geladen. Aktualisiere UI einmalig...", new_icons_found);
 
                     let _ = bg_ui_handle.upgrade_in_event_loop(move |ui| {
-                        let new_mods = list_mod_files_raw(&bg_instance_dir);
-                        ui.set_detail_mod_files(ModelRc::new(VecModel::from(
-                            new_mods.into_iter().map(build_mod_file_info).collect::<Vec<_>>()
-                        )));
+                        invalidate_instance_cache(&bg_instance_name);
+                        let new_mods = list_mod_files_cached(&bg_instance_name, &bg_instance_dir);
+                        ui.set_detail_mod_files(ModelRc::new(VecModel::from(new_mods)));
                         println!("   🔄 UI für Mods aktualisiert.");
                     });
                 } else {
@@ -3703,17 +4385,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     // die Anzeige (enabled/disabled, Button-Text) sofort aktuell ist.
     ui.on_detail_toggle_mod(move |instance_name, filename| {
         let ui = toggle_mod_ui_handle.unwrap();
-
         let launcherDir = dirs::data_local_dir()
             .expect("kein Local Data Dir")
             .join("srusm");
         let instance_dir = launcherDir.join("instances").join(instance_name.to_string());
 
         toggle_mod_file(&instance_dir, &filename);
-
-        let mods_raw = list_mod_files_raw(&instance_dir);
+        invalidate_instance_cache(instance_name.as_str());
         ui.set_detail_mod_files(ModelRc::new(VecModel::from(
-            mods_raw.into_iter().map(build_mod_file_info).collect::<Vec<_>>(),
+            list_mod_files_cached(instance_name.as_str(), &instance_dir),
         )));
     });
 
@@ -3737,16 +4417,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         icons.remove(&plain_name);
         save_mod_icons(&instance_dir, &icons);
         
-        // NEU: mods-list.json aus dem aktualisierten meta-Array regenerieren
-        let mods_list: Vec<ModListEntry> = meta.iter().map(|m| ModListEntry {
-            filename: m.filename.clone(),
-            project_id: m.project_id.clone(),
-        }).collect();
-        save_mods_list(&instance_dir, &mods_list);
+        mods_list_remove(&instance_dir, &plain_name); // Pack-Einträge bleiben erhalten
         
-        let mods_raw = list_mod_files_raw(&instance_dir);
+        invalidate_instance_cache(instance_name.as_str());
         ui.set_detail_mod_files(ModelRc::new(VecModel::from(
-            mods_raw.into_iter().map(build_mod_file_info).collect::<Vec<_>>(),
+            list_mod_files_cached(instance_name.as_str(), &instance_dir),
         )));
     });
 
@@ -3927,7 +4602,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 return;
             };
 
-            push_debug_log(&ui_handle, format!("Suche passende Version für {}...", project_id));
+            //push_debug_log(&ui_handle, format!("Suche passende Version für {}...", project_id));
             let Some(versions) = fetch_pack_versions(&project_id).await else {
                 report_mod_progress(&ui_handle, "Konnte Versionen nicht laden.".to_string());
                 return;
@@ -3944,7 +4619,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut state: HashMap<String, ResolvedMod> = HashMap::new();
 
             for meta in &existing_meta {
-                push_debug_log(&ui_handle, format!("Lade Bestandsdaten für {} ({})", meta.project_name, meta.version_id));
+                //push_debug_log(&ui_handle, format!("Lade Bestandsdaten für {} ({})", meta.project_name, meta.version_id));
                 if let Some(version) = fetch_version_by_id(&meta.version_id).await {
                     state.insert(meta.project_id.clone(), ResolvedMod {
                         project_id: meta.project_id.clone(),
@@ -4134,14 +4809,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             // Icons einmalig vor der Schleife laden, um wiederholte Lese-/Schreibzugriffe zu sparen
             let mut icons = load_mod_icons(&instance_dir);
 
+
+
             for (project_id, rmod) in final_state.iter() {
                 if !confirmed_ids.contains(project_id) { continue; }
                 let Some(file) = rmod.version.files.iter().find(|f| f.primary).or_else(|| rmod.version.files.first()) else { continue; };
-                push_debug_log(&ui_handle, format!("Lade {} für {}...", file.filename, rmod.project_name));
+                //push_debug_log(&ui_handle, format!("Lade {} für {}...", file.filename, rmod.project_name));
                 let Ok(bytes) = download_bytes(&file.url).await else {
-                    push_debug_log(&ui_handle, format!("Download fehlgeschlagen für {}", rmod.project_name));
+                    //push_debug_log(&ui_handle, format!("Download fehlgeschlagen für {}", rmod.project_name));
                     continue;
                 };
+
+                let old_filename: Option<String> = meta.iter().find(|m| &m.project_id == project_id).map(|m| m.filename.clone());
+
                 // Alte Datei dieses Projekts entfernen, falls es ein Versionswechsel ist.
                 if let Some(old) = meta.iter().find(|m| &m.project_id == project_id) {
                     let _ = fs::remove_file(mods_dir.join(&old.filename));
@@ -4149,7 +4829,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     icons.remove(&old.filename);
                 }
                 if let Err(e) = fs::write(mods_dir.join(&file.filename), &bytes) {
-                    push_debug_log(&ui_handle, format!("Konnte Datei nicht schreiben: {e}"));
+                    //push_debug_log(&ui_handle, format!("Konnte Datei nicht schreiben: {e}"));
                     continue;
                 }
                 let icon_url = fetch_project_icon_url(project_id).await;
@@ -4164,30 +4844,28 @@ fn main() -> Result<(), Box<dyn Error>> {
                     project_name: rmod.project_name.clone(),
                     version_id: rmod.version.id.clone(),
                 });
+
+                mods_list_upsert(&instance_dir, project_id, old_filename.as_deref(), &file.filename);
             }
             
             save_mod_meta(&instance_dir, &meta);
-            save_mod_icons(&instance_dir, &icons); // Einmaliges Speichern am Ende
-            
-            // FIX: mods-list.json einfach aus dem aktualisierten meta regenerieren
-            // (Das ersetzt den fehlerhaften 'current_list' Code)
-            let mods_list: Vec<ModListEntry> = meta.iter().map(|m| ModListEntry {
-                filename: m.filename.clone(),
-                project_id: m.project_id.clone(),
-            }).collect();
-            save_mods_list(&instance_dir, &mods_list);
+            save_mod_icons(&instance_dir, &icons);
 
-            let mods_raw = list_mod_files_raw(&instance_dir);
+            // Cache invalidieren + UI einmalig mit frischen Daten aus dem Cache bauen
+            invalidate_instance_cache(&instance_name);
+            let name_for_ui = instance_name.clone();
+            let dir_for_ui = instance_dir.clone();
             let _ = ui_handle.upgrade_in_event_loop(move |ui| {
                 ui.set_add_mod_status("Aktualisiert.".into());
                 ui.set_detail_mod_files(ModelRc::new(VecModel::from(
-                    mods_raw.into_iter().map(build_mod_file_info).collect::<Vec<_>>(),
+                    list_mod_files_cached(&name_for_ui, &dir_for_ui),
                 )));
             });
         });
     });
 
     // Irreconcilable-Fall: Nutzer wählt "deaktivieren" oder "abbrechen".
+        // Irreconcilable-Fall: Nutzer wählt "deaktivieren" oder "abbrechen".
     ui.on_compat_disable_conflicts(move |instance_name| {
         let ui = compat_disable_ui_handle.unwrap();
         let pending_resolution = pending_resolution_disable.clone();
@@ -4196,7 +4874,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         let problems = find_problems(&final_state);
 
         let launcherDir = dirs::data_local_dir().expect("kein Local Data Dir").join("srusm");
-        let instance_dir = launcherDir.join("instances").join(instance_name.to_string());
+        let iname = instance_name.to_string();
+        let instance_dir = launcherDir.join("instances").join(&iname);
         let meta = load_mod_meta(&instance_dir);
 
         let mut to_disable: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -4204,7 +4883,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             match p {
                 Problem::Incompatible { a, .. } => { to_disable.insert(a.clone()); }
                 Problem::NeedsVersion { project_id, .. } => { to_disable.insert(project_id.clone()); }
-                Problem::MissingRequired { project_id, .. } => { to_disable.insert(project_id.clone()); } // NEU
+                Problem::MissingRequired { project_id, .. } => { to_disable.insert(project_id.clone()); }
             }
         }
 
@@ -4213,8 +4892,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let mods_dir = instance_dir.join("mods");
                 let active_path = mods_dir.join(&m.filename);
                 let disabled_path = mods_dir.join(format!("{}.disabled", m.filename));
-                
-                // Nur umbenennen, wenn die aktive (nicht deaktivierte) Datei tatsächlich existiert
                 if active_path.exists() {
                     if let Err(e) = fs::rename(&active_path, &disabled_path) {
                         println!("Konnte Mod nicht deaktivieren: {e}");
@@ -4224,14 +4901,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         ui.set_compat_popup_visible(false);
-        let mods_raw = list_mod_files_raw(&instance_dir);
+        invalidate_instance_cache(&iname);
         ui.set_detail_mod_files(ModelRc::new(VecModel::from(
-            mods_raw.into_iter().map(build_mod_file_info).collect::<Vec<_>>(),
+            list_mod_files_cached(&iname, &instance_dir),
         )));
     });
 
     ui.on_compat_cancel(move || {
         let ui = compat_cancel_ui_handle.unwrap();
+        ui.set_compat_mode("mods".into());
         ui.set_compat_popup_visible(false);
     });
 
@@ -4586,8 +5264,243 @@ fn main() -> Result<(), Box<dyn Error>> {
         let ui = h.unwrap();
         *mod_filter().lock().unwrap() = text.to_string();
         let dir = launcher_dir().join("instances").join(name.as_str());
+        // Cache wird nicht invalidiert — nur aus dem Speicher gelesen!
         ui.set_detail_mod_files(ModelRc::new(VecModel::from(
-            list_mod_files_raw(&dir).into_iter().map(build_mod_file_info).collect::<Vec<_>>(),
+            list_mod_files_cached(name.as_str(), &dir),
+        )));
+    });
+
+        // ===================== Block 3: Manage Instanz =====================
+
+    // Popup öffnen: aktuellen Loader anzeigen und die Versionsliste im Hintergrund laden.
+    let h = ui.as_weak();
+    let hdl = rt.handle().clone();
+    ui.on_manage_open(move |name| {
+        let ui = h.unwrap();
+        let dir = launcher_dir().join("instances").join(name.as_str());
+        ui.set_manage_confirm_delete(false);
+        ui.set_manage_status("".into());
+        ui.set_manage_loader_report("".into());
+        ui.set_manage_loader_pending("".into());
+        ui.set_manage_loader_versions(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+
+        let Some(cfg) = load_instance_config(&dir) else {
+            ui.set_manage_status("instance.json fehlt.".into());
+            ui.set_manage_popup_visible(true);
+            return;
+        };
+        let (kind, id_ver) = split_loader_id(&cfg.loader);
+        let shown = if kind == "none" {
+            "Vanilla (kein Loader)".to_string()
+        } else {
+            format!("{} {}", kind, cfg.loader_version.clone().or(id_ver).unwrap_or_else(|| "(neueste stabile)".to_string()))
+        };
+        ui.set_manage_loader_current(shown.into());
+        ui.set_manage_popup_visible(true);
+        if kind == "none" { return; }
+
+        let (mc, wh) = (cfg.minecraft_version.clone(), h.clone());
+        hdl.spawn(async move {
+            let versions = list_loader_versions(&kind, &mc).await.unwrap_or_default();
+            let _ = wh.upgrade_in_event_loop(move |ui| {
+                let items: Vec<SharedString> = versions.into_iter().map(SharedString::from).collect();
+                ui.set_manage_loader_versions(ModelRc::new(VecModel::from(items)));
+            });
+        });
+    });
+
+    // Duplizieren: Ordner im Hintergrund kopieren, dann Kachel anhängen.
+    let h = ui.as_weak();
+    let hdl = rt.handle().clone();
+    let run = running.clone();
+    ui.on_manage_duplicate(move |name, new_name| {
+        let ui = h.unwrap();
+        if is_running(&run, name.as_str()) { ui.set_manage_status("Die Instanz läuft: bitte erst beenden.".into()); return; }
+        let Some(base) = clean_new_name(new_name.as_str()) else { ui.set_manage_status("Bitte einen gültigen Namen eingeben.".into()); return; };
+        let instances = launcher_dir().join("instances");
+        let target = unique_instance_name(&instances, &base);
+        let (src, dst) = (instances.join(name.as_str()), instances.join(&target));
+        ui.set_manage_status("Kopiere Instanz...".into());
+
+        let wh = h.clone();
+        hdl.spawn(async move {
+            let res = tokio::task::spawn_blocking(move || -> Result<ModpackJsonData, String> {
+                let r = (|| -> Result<ModpackJsonData, String> {
+                    copy_dir_recursive(&src, &dst).map_err(|e| format!("Kopieren fehlgeschlagen: {e}"))?;
+                    let mut cfg = load_instance_config(&dst).ok_or("instance.json fehlt in der Kopie.".to_string())?;
+                    cfg.name = target.clone();
+                    save_instance_config(&dst, &cfg)?;
+                    Ok(cfg)
+                })();
+                if r.is_err() { let _ = fs::remove_dir_all(&dst); } // halbe Kopie wegräumen
+                r
+            }).await.unwrap_or_else(|e| Err(format!("Interner Fehler: {e}")));
+
+            let _ = wh.upgrade_in_event_loop(move |ui| match res {
+                Ok(cfg) => {
+                    with_packs_model(&ui, |vm| vm.push(tile_from_config(&cfg)));
+                    ui.set_manage_status(format!("Dupliziert als '{}'.", cfg.name).into());
+                }
+                Err(e) => ui.set_manage_status(e.into()),
+            });
+        });
+    });
+
+    // Umbenennen: Ordner verschieben, instance.json und Kachel anpassen.
+    let h = ui.as_weak();
+    let run = running.clone();
+    ui.on_manage_rename(move |name, new_name| {
+        let ui = h.unwrap();
+        if is_running(&run, name.as_str()) { ui.set_manage_status("Die Instanz läuft: bitte erst beenden.".into()); return; }
+        let Some(base) = clean_new_name(new_name.as_str()) else { ui.set_manage_status("Bitte einen gültigen Namen eingeben.".into()); return; };
+        if base == name.as_str() { ui.set_manage_status("Der Name ist unverändert.".into()); return; }
+        let instances = launcher_dir().join("instances");
+        let (src, dst) = (instances.join(name.as_str()), instances.join(&base));
+        if dst.exists() { ui.set_manage_status("Eine Instanz mit diesem Namen existiert schon.".into()); return; }
+        if let Err(e) = fs::rename(&src, &dst) { ui.set_manage_status(format!("Umbenennen fehlgeschlagen: {e}").into()); return; }
+
+        if let Some(mut cfg) = load_instance_config(&dst) {
+            cfg.name = base.clone();
+            let _ = save_instance_config(&dst, &cfg);
+            with_packs_model(&ui, |vm| {
+                if let Some(i) = find_tile_row(vm, name.as_str()) { vm.set_row_data(i, tile_from_config(&cfg)); }
+            });
+        }
+        ui.set_detail_instance_name(base.clone().into()); // die Detailansicht zeigt jetzt den neuen Namen
+        ui.set_manage_status(format!("Umbenannt in '{base}'.").into());
+    });
+
+    // Export als .zip in den Downloads-Ordner.
+    let h = ui.as_weak();
+    let hdl = rt.handle().clone();
+    ui.on_manage_export(move |name| {
+        let ui = h.unwrap();
+        let src = launcher_dir().join("instances").join(name.as_str());
+        let target_dir = dirs::download_dir().or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from("."));
+        let stem = sanitize_dir_name(name.as_str());
+        let mut out = target_dir.join(format!("{stem}.zip"));
+        let mut n = 2;
+        while out.exists() { out = target_dir.join(format!("{stem} ({n}).zip")); n += 1; }
+        ui.set_manage_status("Exportiere... (bei großen Instanzen kann das dauern)".into());
+
+        let wh = h.clone();
+        hdl.spawn(async move {
+            let out2 = out.clone();
+            let res = tokio::task::spawn_blocking(move || export_instance_zip(&src, &out2))
+                .await.unwrap_or_else(|e| Err(format!("Interner Fehler: {e}")));
+            let _ = wh.upgrade_in_event_loop(move |ui| match res {
+                Ok(bytes) => ui.set_manage_status(format!("Exportiert nach {} ({} MB unkomprimiert).", out.display(), bytes / 1_048_576).into()),
+                Err(e) => ui.set_manage_status(format!("Export fehlgeschlagen: {e}").into()),
+            });
+        });
+    });
+
+    // Löschen (die Bestätigung passiert schon in der UI).
+    let h = ui.as_weak();
+    let run = running.clone();
+    ui.on_manage_delete(move |name| {
+        let ui = h.unwrap();
+        ui.set_manage_confirm_delete(false);
+        if is_running(&run, name.as_str()) { ui.set_manage_status("Die Instanz läuft: bitte erst beenden.".into()); return; }
+        let dir = launcher_dir().join("instances").join(name.as_str());
+        if let Err(e) = fs::remove_dir_all(&dir) { ui.set_manage_status(format!("Löschen fehlgeschlagen: {e}").into()); return; }
+        with_packs_model(&ui, |vm| { if let Some(i) = find_tile_row(vm, name.as_str()) { vm.remove(i); } });
+        ui.set_manage_popup_visible(false);
+        ui.set_selected_panel("Instanzen".into()); // die Detailansicht der gelöschten Instanz verlassen
+    });
+
+    // Loader: Check mit gewählter Version bzw. mit der neuesten. Das Ergebnis erscheint im Popup,
+    // erst danach kann der Nutzer bestätigen.
+    let h = ui.as_weak();
+    let hdl = rt.handle().clone();
+    let run = running.clone();
+    ui.on_manage_loader_check(move |name, target| {
+        let ui = h.unwrap();
+        if is_running(&run, name.as_str()) { ui.set_manage_status("Die Instanz läuft: bitte erst beenden.".into()); return; }
+        ui.set_manage_loader_pending("".into());
+        ui.set_manage_loader_report("Prüfe Mods...".into());
+        start_loader_check(h.clone(), hdl.clone(), name.to_string(), Some(target.to_string()));
+    });
+
+    let h = ui.as_weak();
+    let hdl = rt.handle().clone();
+    let run = running.clone();
+    ui.on_manage_loader_latest(move |name| {
+        let ui = h.unwrap();
+        if is_running(&run, name.as_str()) { ui.set_manage_status("Die Instanz läuft: bitte erst beenden.".into()); return; }
+        ui.set_manage_loader_pending("".into());
+        ui.set_manage_loader_report("Ermittle neueste Version und prüfe Mods...".into());
+        start_loader_check(h.clone(), hdl.clone(), name.to_string(), None);
+    });
+
+    // Bestätigt: Version in die instance.json schreiben. Installiert wird beim nächsten Start.
+    let h = ui.as_weak();
+    let run = running.clone();
+    ui.on_manage_loader_apply(move |name, version| {
+        let ui = h.unwrap();
+        if is_running(&run, name.as_str()) { ui.set_manage_status("Die Instanz läuft: bitte erst beenden.".into()); return; }
+        let dir = launcher_dir().join("instances").join(name.as_str());
+        let Some(mut cfg) = load_instance_config(&dir) else { ui.set_manage_status("instance.json fehlt.".into()); return; };
+        let (kind, _) = split_loader_id(&cfg.loader);
+        cfg.loader = kind.clone(); // alte CurseForge-IDs ("forge-14.23...") dabei bereinigen
+        cfg.loader_version = Some(version.to_string());
+        if let Err(e) = save_instance_config(&dir, &cfg) { ui.set_manage_status(e.into()); return; }
+        with_packs_model(&ui, |vm| {
+            if let Some(i) = find_tile_row(vm, name.as_str()) { vm.set_row_data(i, tile_from_config(&cfg)); }
+        });
+        ui.set_manage_loader_current(format!("{kind} {version}").into());
+        ui.set_manage_loader_pending("".into());
+        ui.set_manage_loader_report("".into());
+        ui.set_manage_status(format!("Loader auf {version} gestellt. Beim nächsten Start wird er installiert.").into());
+    });
+
+        // ===================== Block 4: Doppelte Mods beheben =====================
+
+    // Schritt 1: Vorschläge berechnen und im Kompatibilitäts-Popup zur Bestätigung zeigen.
+    // Nichts wird geändert, bevor der Nutzer "Übernehmen" drückt. Ohne Erlaubnis (Misc) passiert gar nichts.
+    let h = ui.as_weak();
+    ui.on_duplicates_fix(move |name| {
+        let ui = h.unwrap();
+        let dir = launcher_dir().join("instances").join(name.as_str());
+        if !load_misc(&dir).auto_fix_duplicates {
+            ui.set_dup_status("Gesperrt: im Misc-Popup erlauben und speichern.".into());
+            return;
+        }
+        let proposals = duplicate_proposals(&dir);
+        if proposals.is_empty() {
+            ui.set_dup_status("Keine behebbaren Duplikate gefunden (nur Mods aus mods-list.json werden erkannt).".into());
+            return;
+        }
+        // project_id dient hier als Schlüssel = Dateiname (eindeutig); das Umschalten läuft über compat_toggle_action.
+        let actions: Vec<CompatibilityActionUi> = proposals.into_iter()
+            .map(|(file, label)| CompatibilityActionUi { project_id: file.into(), label: label.into(), confirmed: true })
+            .collect();
+        ui.set_compat_actions(ModelRc::new(VecModel::from(actions)));
+        ui.set_compat_conflict_visible(false);
+        ui.set_compat_mode("duplicates".into());
+        ui.set_compat_popup_visible(true);
+    });
+
+        // Schritt 2: nur die bestätigten Zeilen anwenden (Dateien deaktivieren).
+    let h = ui.as_weak();
+    ui.on_duplicates_apply(move |name| {
+        let ui = h.unwrap();
+        let dir = launcher_dir().join("instances").join(name.as_str());
+        let model = ui.get_compat_actions();
+        let files: Vec<String> = (0..model.row_count())
+            .filter_map(|i| model.row_data(i))
+            .filter(|a| a.confirmed)
+            .map(|a| a.project_id.to_string())
+            .collect();
+        for f in &files {
+            if dir.join("mods").join(f).exists() { toggle_mod_file(&dir, f); }
+        }
+        ui.set_compat_popup_visible(false);
+        ui.set_compat_mode("mods".into());
+        ui.set_dup_status(format!("{} Mods deaktiviert.", files.len()).into());
+        invalidate_instance_cache(name.as_str());
+        ui.set_detail_mod_files(ModelRc::new(VecModel::from(
+            list_mod_files_cached(name.as_str(), &dir),
         )));
     });
 

@@ -132,7 +132,7 @@ component BrowserTile inherits Rectangle {
 }
 
 struct ModpackInfo { name: string, minecraft_version: string, loader: string, ram_mb: int, icon: image }
-struct ModFileInfo { filename: string, display_name: string, enabled: bool, icon: image, duplicate: bool } // duplicate = Mod kommt mehrfach vor (orange)
+struct ModFileInfo { filename: string, display_name: string, enabled: bool, icon: image, duplicate: bool, dup_total: int } // dup_total = Gesamtzahl doppelter Dateien (steht in jeder Zeile)
 struct AccountInfo { id: string, username: string, kind: string, selected: bool }
 
 struct RunningInstance { name: string }
@@ -307,6 +307,11 @@ export component AppWindow inherits Window {
     callback manage_loader_latest(string);
     // Doppelte Mods (Block 4)
     callback duplicates_fix(string);
+    callback duplicates_apply(string);               // instance -> bestätigte Vorschläge anwenden
+    in-out property <string> compat_mode: "mods";    // "mods" oder "duplicates": das Kompatibilitäts-Popup dient beiden
+    in-out property <string> dup_status: "";
+    // Anzahl doppelter Mods, aus der ersten Zeile der Liste gelesen (siehe dup_total in ModFileInfo)
+    property <int> dup_total: root.detail_mod_files.length > 0 ? root.detail_mod_files[0].dup_total : 0;
 
     // Vars
     in-out property <bool> popup_new_instance: false;
@@ -399,6 +404,11 @@ export component AppWindow inherits Window {
     in-out property <string> manage_status: "";
     in property <[string]> manage_loader_versions;
     in-out property <string> manage_loader_current: "";
+    // Ergänzungen zu Block 1 (die dort deklarierten Namen bleiben unverändert)
+    callback manage_loader_apply(string, string);   // instance, bestätigte Version
+    in property <string> manage_loader_pending: ""; // Version, die nach erfolgreichem Check bestätigt werden kann
+    in property <string> manage_loader_report: "";  // Ergebnistext des Checks
+    in-out property <bool> manage_confirm_delete: false;
 
     // NEU: Aktuelle Quelle im Browser (Standard ist Modrinth)
     in-out property <string> browser_source: "Modrinth";
@@ -797,221 +807,254 @@ export component AppWindow inherits Window {
                     Rectangle { vertical-stretch: 1; }
                 }
 
-                if selected_panel == "Instance Detail" : VerticalLayout {
-                    padding: 20px;
-                    spacing: 16px;
+                if selected_panel == "Instance Detail" : ScrollView {
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 16px;
 
-                    HorizontalLayout {
-                        max-height: 30px;
-                        spacing: 10px;
-                        Button {
-                            text: "< Zurück";
-                            width: 90px;
-                            clicked => { root.selected_panel = "Instanzen" }
-                        }
-                        Image { source: root.detail_instance_icon; width: 28px; height: 28px; }
-                        Text {
-                            text: root.detail_instance_name;
-                            font-size: 20px;
-                            font-weight: 900;
-                            color: white;
-                            vertical-alignment: center;
-                        }
-                        Text { text: "Spielzeit: " + root.instance_playtime(root.detail_instance_name, root.playtime_tick); color: #7bdc8a; font-size: 12px; vertical-alignment: center; }
-                    }
-
-                    Text { text: "Mods"; font-size: 16px; font-weight: 700; color: white; }
-                    HorizontalLayout {
-                        max-height: 30px;
-                        spacing: 10px;
-                        alignment: start; // Buttons behalten ihre feste Breite und stehen links nebeneinander
-
-                        LineEdit {
-                            placeholder-text: "Mods durchsuchen...";
-                            text <=> root.mod_filter;
-                            edited(t) => { root.detail_filter_mods(root.detail_instance_name, t) }
-                        }
-
-                        Button {
-                            text: "+ Mod hinzufügen";
-                            width: 160px;
-                            clicked => {
-                                root.add_mod_popup_visible = true;
-                                root.add_mod_status = "";
-                                root.detail_add_mod_search("");
+                        HorizontalLayout {
+                            max-height: 30px;
+                            spacing: 10px;
+                            Button {
+                                text: "< Zurück";
+                                width: 90px;
+                                clicked => { root.selected_panel = "Instanzen" }
                             }
+                            Image { source: root.detail_instance_icon; width: 28px; height: 28px; }
+                            Text {
+                                text: root.detail_instance_name;
+                                font-size: 20px;
+                                font-weight: 900;
+                                color: white;
+                                vertical-alignment: center;
+                            }
+                            Text { text: "Spielzeit: " + root.instance_playtime(root.detail_instance_name, root.playtime_tick); color: #7bdc8a; font-size: 12px; vertical-alignment: center; }
                         }
-                        Button {
-                            text: "Im Ordner öffnen";
-                            width: 160px;
-                            clicked => { root.detail_open_folder(root.detail_instance_name) }
-                        }
-                        Button { text: "Misc"; width: 80px; clicked => { root.misc_open(root.detail_instance_name) } }
-                        Button { text: "Manage Instanz"; width: 130px; clicked => { root.manage_open(root.detail_instance_name) } }
-                    }
 
-                    mods_scroll := ScrollView {
-                        vertical-stretch: 1;
-                        VerticalLayout {
-                            alignment: start;
-                            spacing: 4px;
-                            for mod_file in root.detail_mod_files : HorizontalLayout {
-                                max-height: 26px;
-                                spacing: 10px;
-                                Image { source: mod_file.icon; width: 20px; height: 20px; }
-                                Text {
-                                    text: mod_file.display_name;
-                                    color: mod_file.duplicate ? #ff9a2e : (mod_file.enabled ? white : #7a8291); // orange = doppelt
-                                    vertical-alignment: center;
-                                    horizontal-stretch: 1;
-                                    overflow: elide;
-                                }
-                                Button {
-                                    text: mod_file.enabled ? "Deaktivieren" : "Aktivieren";
-                                    width: 110px;
-                                    height: 24px;
-                                    clicked => { root.detail_toggle_mod(root.detail_instance_name, mod_file.filename) }
-                                }
-                                Button {
-                                    text: "Entfernen";
-                                    width: 90px;
-                                    height: 24px;
-                                    clicked => { root.detail_remove_mod(root.detail_instance_name, mod_file.filename) }
+                        Text { text: "Mods"; font-size: 16px; font-weight: 700; color: white; }
+                        HorizontalLayout {
+                            max-height: 30px;
+                            spacing: 10px;
+                            alignment: start; // Buttons behalten ihre feste Breite und stehen links nebeneinander
+
+                            LineEdit {
+                                placeholder-text: "Mods durchsuchen...";
+                                text <=> root.mod_filter;
+                                edited(t) => { root.detail_filter_mods(root.detail_instance_name, t) }
+                            }
+
+                            Button {
+                                text: "+ Mod hinzufügen";
+                                width: 160px;
+                                clicked => {
+                                    root.add_mod_popup_visible = true;
+                                    root.add_mod_status = "";
+                                    root.detail_add_mod_search("");
                                 }
                             }
+                            Button {
+                                text: "Im Ordner öffnen";
+                                width: 160px;
+                                clicked => { root.detail_open_folder(root.detail_instance_name) }
+                            }
+                            Button { text: "Misc"; width: 80px; clicked => { root.misc_open(root.detail_instance_name) } }
+                            Button { text: "Manage Instanz"; width: 130px; clicked => { root.manage_open(root.detail_instance_name) } }
                         }
-                    }
-                    
-                    Rectangle {
-                        background: #232c3a;
-                        border-radius: 6px;
-                        height: root.detail_quick_supported ? 46px : 66px;
 
-                        VerticalLayout {
-                            padding: 8px;
-                            spacing: 4px;
-                            HorizontalLayout {
-                                spacing: 8px;
-                                CheckBox { text: "Direkt verbinden"; enabled: root.detail_quick_supported; checked <=> root.detail_quick_enabled; }
-                                LineEdit { placeholder-text: "Server (z.B. mc.example.net)"; enabled: root.detail_quick_supported; text <=> root.detail_quick_server; }
-                                LineEdit { placeholder-text: "oder Weltname"; enabled: root.detail_quick_supported; text <=> root.detail_quick_world; }
-                                Button {
-                                    text: "Speichern";
-                                    width: 90px;
-                                    enabled: root.detail_quick_supported;
-                                    clicked => { root.detail_save_quick(root.detail_instance_name, root.detail_quick_enabled, root.detail_quick_server, root.detail_quick_world) }
+                        mods_scroll := ScrollView {
+                            height: 260px; // feste Höhe, die ganze Seite scrollt jetzt außen
+                            VerticalLayout {
+                                alignment: start;
+                                spacing: 4px;
+                                for mod_file in root.detail_mod_files : HorizontalLayout {
+                                    max-height: 26px;
+                                    spacing: 10px;
+                                    Image { source: mod_file.icon; width: 20px; height: 20px; }
+                                    Text {
+                                        text: mod_file.display_name;
+                                        color: mod_file.duplicate ? #ff9a2e : (mod_file.enabled ? white : #7a8291); // orange = doppelt
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                    }
+                                    Button {
+                                        text: mod_file.enabled ? "Deaktivieren" : "Aktivieren";
+                                        width: 110px;
+                                        height: 24px;
+                                        clicked => { root.detail_toggle_mod(root.detail_instance_name, mod_file.filename) }
+                                    }
+                                    Button {
+                                        text: "Entfernen";
+                                        width: 90px;
+                                        height: 24px;
+                                        clicked => { root.detail_remove_mod(root.detail_instance_name, mod_file.filename) }
+                                    }
+                                }
+
+                                // ---- Gruppe "Doppelte Mods" unter einem Trennstrich ----
+                                if root.dup_total > 0 : Rectangle { height: 1px; background: #55607a; }
+                                if root.dup_total > 0 : Text { text: "Doppelte Mods (" + root.dup_total + ")"; color: #ff9a2e; font-weight: 700; }
+                                if root.dup_total > 0 : VerticalLayout {
+                                    spacing: 0px; // damit die ausgeblendeten Zeilen (Höhe 0) keine Lücken erzeugen
+                                    for m in root.detail_mod_files : Rectangle {
+                                        height: m.duplicate ? 22px : 0px;
+                                        clip: true;
+                                        Text { text: m.display_name; color: #ff9a2e; font-size: 12px; vertical-alignment: center; overflow: elide; }
+                                    }
+                                }
+                                if root.dup_total > 0 : HorizontalLayout {
+                                    height: 28px;
+                                    spacing: 10px;
+                                    Button {
+                                        text: "Doppelte Mods beheben...";
+                                        width: 210px;
+                                        enabled: root.misc_auto_fix_dupes; // standardmäßig gesperrt (Misc-Popup)
+                                        clicked => { root.duplicates_fix(root.detail_instance_name) }
+                                    }
+                                    Text {
+                                        text: root.misc_auto_fix_dupes ? root.dup_status : "Gesperrt: erst im Misc-Popup \"Automatisches Beheben erlauben\" aktivieren und speichern.";
+                                        color: #a0a8b5;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                        wrap: word-wrap;
+                                    }
                                 }
                             }
-                            if !root.detail_quick_supported : Text { text: "Quick Play gibt es erst ab Minecraft 1.20."; color: #ff9a2e; font-size: 11px; }
                         }
-                    }
-
-                    Rectangle { height: 10px; }
-                    Text { text: "Erweiterte Einstellungen für diese Instanz"; font-size: 16px; font-weight: 700; color: white; }
-
-                    detail_overrides_box := CheckBox {
-                        text: "Globale Einstellungen für diese Instanz überschreiben";
-                        checked <=> root.detail_overrides_enabled; // Zwei-Wege: Klick ändert die Property, Rust-Setter ändert die Checkbox
-                    }
-
-                    ScrollView {
-                        vertical-stretch: 1;
-                        visible: detail_overrides_box.checked;
                         
                         Rectangle {
                             background: #232c3a;
                             border-radius: 6px;
-                            
+                            height: root.detail_quick_supported ? 46px : 66px;
+
                             VerticalLayout {
-                                spacing: 12px;
-                                padding: 10px;
-
-                                // 1. RAM (Slider + MB/GB Toggle)
-                                Text { text: "Zugewiesener Arbeitsspeicher"; font-size: 14px; font-weight: 700; color: #a0a8b5; }
+                                padding: 8px;
+                                spacing: 4px;
                                 HorizontalLayout {
-                                    spacing: 10px;
-                                    detail_ram_slider := Slider {
-                                        minimum: 1;
-                                        maximum: 32;
-                                        value: root.detail_ram_mb / 1024; 
-                                        horizontal-stretch: 1;
+                                    spacing: 8px;
+                                    CheckBox { text: "Direkt verbinden"; enabled: root.detail_quick_supported; checked <=> root.detail_quick_enabled; }
+                                    LineEdit { placeholder-text: "Server (z.B. mc.example.net)"; enabled: root.detail_quick_supported; text <=> root.detail_quick_server; }
+                                    LineEdit { placeholder-text: "oder Weltname"; enabled: root.detail_quick_supported; text <=> root.detail_quick_world; }
+                                    Button {
+                                        text: "Speichern";
+                                        width: 90px;
+                                        enabled: root.detail_quick_supported;
+                                        clicked => { root.detail_save_quick(root.detail_instance_name, root.detail_quick_enabled, root.detail_quick_server, root.detail_quick_world) }
                                     }
+                                }
+                                if !root.detail_quick_supported : Text { text: "Quick Play gibt es erst ab Minecraft 1.20."; color: #ff9a2e; font-size: 11px; }
+                            }
+                        }
+
+                        Rectangle { height: 10px; }
+                        Text { text: "Erweiterte Einstellungen für diese Instanz"; font-size: 16px; font-weight: 700; color: white; }
+
+                        detail_overrides_box := CheckBox {
+                            text: "Globale Einstellungen für diese Instanz überschreiben";
+                            checked <=> root.detail_overrides_enabled; // Zwei-Wege: Klick ändert die Property, Rust-Setter ändert die Checkbox
+                        }
+
+                        Rectangle {
+                            // Immer vorhanden (damit detail_ram_slider vom Speichern-Button erreichbar bleibt),
+                            // nur ein-/ausgeblendet: bei ausgeschaltetem Override Höhe 0 und unsichtbar.
+                            height: detail_overrides_box.checked ? 360px : 0px;
+                            visible: detail_overrides_box.checked;
+                            
+                            Rectangle {
+                                background: #232c3a;
+                                border-radius: 6px;
+                                
+                                VerticalLayout {
+                                    spacing: 12px;
+                                    padding: 10px;
+
+                                    // 1. RAM (Slider + MB/GB Toggle)
+                                    Text { text: "Zugewiesener Arbeitsspeicher"; font-size: 14px; font-weight: 700; color: #a0a8b5; }
+                                    HorizontalLayout {
+                                        spacing: 10px;
+                                        detail_ram_slider := Slider {
+                                            minimum: 1;
+                                            maximum: 32;
+                                            value: root.detail_ram_mb / 1024; 
+                                            horizontal-stretch: 1;
+                                        }
+                                        ComboBox {
+                                            width: 80px;
+                                            model: ["MB", "GB"];
+                                            current-value <=> root.detail_ram_unit; // Automatische Zwei-Wege-Bindung
+                                            //activated(index) => { root.detail_ram_unit = self.model[index]; }
+                                        }
+                                        Text {
+                                            width: 80px;
+                                            text: root.detail_ram_unit == "GB" 
+                                                ? round(detail_ram_slider.value) + " GB" 
+                                                : round(detail_ram_slider.value * 1024) + " MB";
+                                            color: white;
+                                            vertical-alignment: center;
+                                            font-weight: 700;
+                                        }
+                                    }
+
+                                    // 2. Java Pfad Dropdown
+                                    Text { text: "Java Ausführungspfad"; font-size: 14px; font-weight: 700; color: #a0a8b5; }
                                     ComboBox {
-                                        width: 80px;
-                                        model: ["MB", "GB"];
-                                        current-value <=> root.detail_ram_unit; // Automatische Zwei-Wege-Bindung
-                                        //activated(index) => { root.detail_ram_unit = self.model[index]; }
+                                        model: root.available_java_paths;
+                                        current-value <=> root.detail_java_selection; // Automatische Zwei-Wege-Bindung
                                     }
-                                    Text {
-                                        width: 80px;
-                                        text: root.detail_ram_unit == "GB" 
-                                              ? round(detail_ram_slider.value) + " GB" 
-                                              : round(detail_ram_slider.value * 1024) + " MB";
-                                        color: white;
-                                        vertical-alignment: center;
-                                        font-weight: 700;
+
+                                    // 3. Account Auswahl Dropdown
+                                    Text { text: "Benutzerkonto für diese Instanz"; font-size: 14px; font-weight: 700; color: #a0a8b5; }
+                                    ComboBox {
+                                        model: root.available_accounts;
+                                        current-value <=> root.detail_account_selection;
                                     }
-                                }
 
-                                // 2. Java Pfad Dropdown
-                                Text { text: "Java Ausführungspfad"; font-size: 14px; font-weight: 700; color: #a0a8b5; }
-                                ComboBox {
-                                    model: root.available_java_paths;
-                                    current-value <=> root.detail_java_selection; // Automatische Zwei-Wege-Bindung
-                                }
-
-                                // 3. Account Auswahl Dropdown
-                                Text { text: "Benutzerkonto für diese Instanz"; font-size: 14px; font-weight: 700; color: #a0a8b5; }
-                                ComboBox {
-                                    model: root.available_accounts;
-                                    current-value <=> root.detail_account_selection;
-                                }
-
-                                // 4. Fenstergröße
-                                Text { text: "Fenstergröße"; font-size: 14px; font-weight: 700; color: #a0a8b5; }
-                                HorizontalLayout {
-                                    spacing: 10px;
-                                    Text { text: "Breite:"; color: white; vertical-alignment: center; width: 60px; }
-                                    SpinBox {
-                                        value <=> root.detail_window_width; // Automatische Zwei-Wege-Bindung
-                                        width: 80px;
-                                        minimum: 640;
-                                        maximum: 3840;
+                                    // 4. Fenstergröße
+                                    Text { text: "Fenstergröße"; font-size: 14px; font-weight: 700; color: #a0a8b5; }
+                                    HorizontalLayout {
+                                        spacing: 10px;
+                                        Text { text: "Breite:"; color: white; vertical-alignment: center; width: 60px; }
+                                        SpinBox {
+                                            value <=> root.detail_window_width; // Automatische Zwei-Wege-Bindung
+                                            width: 80px;
+                                            minimum: 640;
+                                            maximum: 3840;
+                                        }
+                                        Text { text: "Höhe:"; color: white; vertical-alignment: center; width: 60px; }
+                                        SpinBox {
+                                            value <=> root.detail_window_height; // Automatische Zwei-Wege-Bindung
+                                            width: 80px;
+                                            minimum: 480;
+                                            maximum: 2160;
+                                        }
+                                        CheckBox { 
+                                            text: "Vollbild"; 
+                                            checked <=> root.detail_fullscreen;
+                                        }
                                     }
-                                    Text { text: "Höhe:"; color: white; vertical-alignment: center; width: 60px; }
-                                    SpinBox {
-                                        value <=> root.detail_window_height; // Automatische Zwei-Wege-Bindung
-                                        width: 80px;
-                                        minimum: 480;
-                                        maximum: 2160;
-                                    }
-                                    CheckBox { 
-                                        text: "Vollbild"; 
-                                        checked <=> root.detail_fullscreen;
-                                    }
-                                }
-                            } // <--- Schließt VerticalLayout
-                        } // <--- Schließt Rectangle (das fehlte!)
-                    } // <--- Schließt ScrollView (das fehlte!)
+                                } // <--- Schließt VerticalLayout
+                            } // <--- Schließt Rectangle (das fehlte!)
+                        } // <--- Schließt ScrollView (das fehlte!)
 
-                    Rectangle { vertical-stretch: 1; }
+                        Rectangle { vertical-stretch: 1; }
 
-                    Button {
-                        text: "Einstellungen speichern";
-                        primary: true;
-                        width: 100%;
-                        clicked => {
-                            let final_ram_mb = round(detail_ram_slider.value * 1024);
-                            root.detail_save_overrides(
-                                root.detail_instance_name,
-                                root.detail_overrides_enabled,
-                                final_ram_mb,
-                                root.detail_java_selection,
-                                root.detail_account_selection,
-                                root.detail_window_width,
-                                root.detail_window_height,
-                                root.detail_fullscreen
-                            );
+                        Button {
+                            text: "Einstellungen speichern";
+                            primary: true;
+                            width: 100%;
+                            clicked => {
+                                let final_ram_mb = round(detail_ram_slider.value * 1024);
+                                root.detail_save_overrides(
+                                    root.detail_instance_name,
+                                    root.detail_overrides_enabled,
+                                    final_ram_mb,
+                                    root.detail_java_selection,
+                                    root.detail_account_selection,
+                                    root.detail_window_width,
+                                    root.detail_window_height,
+                                    root.detail_fullscreen
+                                );
+                            }
                         }
                     }
                 } // <--- Schließt den gesamten Instance Detail Block
@@ -1109,7 +1152,86 @@ export component AppWindow inherits Window {
                     Text { text: "Manage: " + root.detail_instance_name; color: white; font-size: 16px; font-weight: 700; vertical-alignment: center; horizontal-stretch: 1; }
                     Button { text: "Schließen"; width: 90px; clicked => { root.manage_popup_visible = false } }
                 }
-                Rectangle { vertical-stretch: 1; } // Inhalt kommt in Block 3
+                ScrollView {
+                    vertical-stretch: 1;
+
+                    VerticalLayout {
+                        alignment: start;
+                        spacing: 12px;
+                        padding: 4px;
+
+                        MiscCard {
+                            title: "Duplizieren";
+                            hint: "Kopiert die komplette Instanz (Mods, Configs, Welten) unter neuem Namen.";
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                dup_name_box := LineEdit { placeholder-text: "Neuer Name"; horizontal-stretch: 1; }
+                                Button { text: "Duplizieren"; width: 110px; clicked => { root.manage_duplicate(root.detail_instance_name, dup_name_box.text) } }
+                            }
+                        }
+
+                        MiscCard {
+                            title: "Umbenennen";
+                            hint: "Benennt Ordner und Instanz um. Die Instanz darf dabei nicht laufen.";
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                rename_box := LineEdit { placeholder-text: "Neuer Name"; horizontal-stretch: 1; }
+                                Button { text: "Umbenennen"; width: 110px; clicked => { root.manage_rename(root.detail_instance_name, rename_box.text) } }
+                            }
+                        }
+
+                        MiscCard {
+                            title: "Exportieren";
+                            hint: "Packt die Instanz (ohne logs und crash-reports) als .zip in deinen Downloads-Ordner.";
+                            Button { text: "Als .zip exportieren"; width: 190px; clicked => { root.manage_export(root.detail_instance_name) } }
+                        }
+
+                        MiscCard {
+                            title: "Loader-Version";
+                            hint: "Aktuell: " + root.manage_loader_current + ". Vor jedem Wechsel werden die Mods geprüft; bei Konflikten wird nichts geändert.";
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                loader_combo := ComboBox { model: root.manage_loader_versions; horizontal-stretch: 1; }
+                                Button { text: "Prüfen"; width: 90px; clicked => { root.manage_loader_check(root.detail_instance_name, loader_combo.current-value) } }
+                                Button { text: "Neueste prüfen"; width: 130px; clicked => { root.manage_loader_latest(root.detail_instance_name) } }
+                            }
+                            if root.manage_loader_report != "" : Text { text: root.manage_loader_report; color: #dddddd; font-size: 12px; wrap: word-wrap; }
+                            if root.manage_loader_pending != "" : HorizontalLayout {
+                                height: 30px;
+                                Button {
+                                    text: "Wechsel bestätigen (" + root.manage_loader_pending + ")";
+                                    primary: true;
+                                    clicked => { root.manage_loader_apply(root.detail_instance_name, root.manage_loader_pending) }
+                                }
+                            }
+                        }
+
+                        MiscCard {
+                            title: "Löschen";
+                            hint: "Löscht die Instanz samt Welten endgültig. Eine laufende Instanz kann nicht gelöscht werden.";
+                            if !root.manage_confirm_delete : Button { text: "Instanz löschen..."; width: 170px; clicked => { root.manage_confirm_delete = true } }
+                            if root.manage_confirm_delete : HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                Text { text: "Wirklich löschen? Das geht nicht rückgängig."; color: #e08a8a; vertical-alignment: center; horizontal-stretch: 1; }
+                                Rectangle {
+                                    width: 110px;
+                                    height: 26px;
+                                    border-radius: 4px;
+                                    background: del_area.has-hover ? #e04040 : #c93030;
+                                    del_area := TouchArea { clicked => { root.manage_delete(root.detail_instance_name) } }
+                                    Text { text: "Ja, löschen"; color: white; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                                Button { text: "Abbrechen"; width: 90px; clicked => { root.manage_confirm_delete = false } }
+                            }
+                        }
+
+                        if root.manage_status != "" : Text { text: root.manage_status; color: #a0d8a0; wrap: word-wrap; }
+                    }
+                }
             }
         }
     }
@@ -1498,7 +1620,14 @@ export component AppWindow inherits Window {
                 if !root.compat_conflict_visible : HorizontalLayout {
                     spacing: 10px;
                     Button { text: "Abbrechen"; clicked => { root.compat_cancel() } }
-                    Button { text: "Übernehmen"; primary: true; clicked => { root.compat_apply(root.detail_instance_name) } }
+                    Button {
+                        text: "Übernehmen";
+                        primary: true;
+                        clicked => {
+                            if root.compat_mode == "duplicates" { root.duplicates_apply(root.detail_instance_name) }
+                            else { root.compat_apply(root.detail_instance_name) }
+                        }
+                    }
                 }
 
                 if root.compat_conflict_visible : Text {

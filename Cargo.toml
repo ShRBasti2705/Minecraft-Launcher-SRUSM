@@ -16,10 +16,27 @@ reqwest = { version = "0.12", features = ["json"] }
 zip = "2"
 image = { version = "0.25", default-features = false, features = ["webp", "png"] }
 futures = "0.3"
+hotpath = "0.28.2"
 
 [build-dependencies]
 slint-build = "1.16.1"
 
+[features]
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath/hotpath-alloc"] # Optional, um auch Speicherallokationen zu messen
+
+#[profile.release]
+#codegen-units = 1
+#lto = true
+
 [profile.release]
+opt-level = 3
+lto = "thin"          # oder "fat" für max Performance
 codegen-units = 1
-lto = true
+panic = "abort"
+strip = "symbols"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
