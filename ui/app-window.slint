@@ -4,15 +4,40 @@ component ModpackTile inherits Rectangle {
     in property <string> name;
     in property <string> playtime; // Spielzeit-Text von Rust
     in property <image> icon;
+    in property <bool> starred: false;
+    in property <string> action_text: "Install"; // NEU: Button-Beschriftung, im Preset-Popup "Hinzufügen"
 
     width: 120px;
     height: 170px;
 
     callback modpack_play(string);
     callback modpack_details(string);
+    callback toggle_star(string); // Feature 6
 
     TouchArea {
         clicked => { root.modpack_details(root.name) }
+    }
+
+    // Feature 6: Stern oben rechts als kleines overlay
+    Rectangle {
+        x: parent.width - 26px;
+        y: 4px;
+        width: 22px;
+        height: 22px;
+        border-radius: 11px;
+        background: star_area.has-hover ? #3a4556 : #2c3747;
+
+        star_area := TouchArea {
+            clicked => { root.toggle_star(root.name); }
+        }
+
+        Text {
+            text: root.starred ? "★" : "☆";
+            color: root.starred ? #ffd43b : #7a8291;
+            font-size: 14px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
     }
 
     VerticalLayout {
@@ -47,7 +72,7 @@ component ModpackTile inherits Rectangle {
     }
 }
 
-struct BrowserPackInfo { project_id: string, name: string, summary: string, author: string, icon: image, source: string }
+struct BrowserPackInfo { project_id: string, name: string, summary: string, author: string, icon: image, source: string, starred: bool }
 struct CompatibilityActionUi { project_id: string, label: string, confirmed: bool }
 
 component BrowserTile inherits Rectangle {
@@ -57,13 +82,39 @@ component BrowserTile inherits Rectangle {
     in property <string> author;
     in property <image> icon;
     in property <string> source;
+    in property <bool> starred: false;
+    in property <string> action_text: "Install";
 
     callback install_clicked(string, string, string);
+    callback add_to_preset(string, string); // project_id, project_name — für den Preset-Tab
+    callback toggle_star(string); // Feature 6
 
     width: 260px;
     height: 120px;
     background: #2c3747;
     border-radius: 6px;
+
+    // Feature 6: Stern links vom Source-Badge
+    Rectangle {
+        x: parent.width - 100px;
+        y: 4px;
+        width: 22px;
+        height: 16px;
+        border-radius: 4px;
+        background: star_area.has-hover ? #3a4556 : #232c3a;
+
+        star_area := TouchArea {
+            clicked => { root.toggle_star(root.project_id); }
+        }
+
+        Text {
+            text: root.starred ? "★" : "☆";
+            color: root.starred ? #ffd43b : #7a8291;
+            font-size: 11px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
 
     Rectangle {
         x: parent.width - 72px;
@@ -123,7 +174,7 @@ component BrowserTile inherits Rectangle {
                 horizontal-stretch: 1; 
             }
             Button { 
-                text: "Install"; 
+                text: root.action_text; // GEÄNDERT: war fest "Install"
                 height: 22px; 
                 clicked => { root.install_clicked(root.project_id, root.name, root.source) } 
             }
@@ -131,15 +182,72 @@ component BrowserTile inherits Rectangle {
     }
 }
 
-struct ModpackInfo { name: string, minecraft_version: string, loader: string, ram_mb: int, icon: image }
-struct ModFileInfo { filename: string, display_name: string, enabled: bool, icon: image, duplicate: bool, dup_total: int } // dup_total = Gesamtzahl doppelter Dateien (steht in jeder Zeile)
+struct ModpackInfo { name: string, minecraft_version: string, loader: string, ram_mb: int, icon: image, starred: bool }
+struct ModFileInfo { filename: string, display_name: string, enabled: bool, icon: image, duplicate: bool, dup_total: int, orphan: bool} // dup_total = Gesamtzahl doppelter Dateien (steht in jeder Zeile)
 struct AccountInfo { id: string, username: string, kind: string, selected: bool }
+
+struct StatRowUi {
+    name: string,
+    text: string,
+    fraction: float
+}
+
+struct PresetUi {
+    id: string,
+    name: string,
+    mc_version: string,
+    loader: string,
+    mod_count: int,
+    suggested_loader_version: string,
+}
+
+struct PresetModUi {
+    project_id: string,
+    project_name: string,
+    icon: image,
+}
+
+struct WorldInfoUi {
+    folder_name: string,
+    display_name: string,
+    icon: image,
+    game_type_text: string,
+    hardcore: bool,
+    version: string,
+    last_played_text: string,
+}
+
+struct ServerInfoUi {
+    name: string,
+    ip: string,
+    icon: image,
+    status: string,       // "unknown" | "checking" | "online" | "offline"
+    players_text: string,
+    motd: string,
+}
 
 struct RunningInstance { name: string }
 struct EnvVarUi { name: string, value: string }
-struct PresetUi { id: string, title: string, description: string, flags: string, suggested: bool }
+struct JvmPresetUi { id: string, title: string, description: string, flags: string, suggested: bool }
 struct WrapperUi { id: string, label: string, hint: string, available: bool, enabled: bool }
 struct DuplicateUi { project_name: string, files: string } // Block 4: Gruppe "Doppelte Mods"
+struct CrashFindingUi { title: string, explanation: string, suggestion: string, mod_file: string }
+struct LocalServerUi { name: string, mc_version: string, loader: string, port: int, running: bool, installed: bool, port_conflict: bool }
+
+struct AchievementUi {
+    title: string,
+    title_big: string,     // GROSS geschrieben, für die Karten
+    description: string,
+    kind: string,          // "advancement" | "goal" | "challenge" | "achievement"
+    meta: string,          // Instanz · Welt/Server · MC-Version · Zeit
+    short: string,         // Zeit (für die Listenzeilen)
+    line: string,          // "Welt/Server - Achievement" (für die Listenzeilen)
+    header: string,        // nur in der ersten Zeile einer Gruppe gefüllt, mit Pfeil
+    instance: string,      // Instanzname (für das Ein-/Ausklappen)
+    collapsed: bool,       // Gruppe eingeklappt?
+    icon: image,
+    is_new: bool,
+}
 
 // Ein-/ausklappbare Leiste am unteren Fensterrand mit den laufenden Instanzen.
 // Sie schiebt den Inhalt darüber nach oben (siehe AppWindow), statt ihn zu überdecken.
@@ -147,13 +255,14 @@ component RunningBar inherits Rectangle {
     in property <[RunningInstance]> instances;
     in-out property <bool> expanded: false;
     callback force_stop(string); // Instanzname
+    callback open_console(string); // öffnet die Live-Konsole einer Instanz
 
     // Höhe der Liste: pro Zeile 32px, mindestens Platz für den Leer-Text, maximal 150px (dann scrollt sie)
     property <length> list_height: min(150px, max(40px, root.instances.length * 32px + 8px));
 
     height: root.expanded ? 30px + root.list_height : 30px;
     background: #1b2330;
-    clip: true; // während der Animation nichts über den Rand zeichnen
+    clip: true;
     animate height { duration: 150ms; easing: ease-in-out; }
 
     VerticalLayout {
@@ -171,7 +280,6 @@ component RunningBar inherits Rectangle {
                 padding-right: 12px;
                 spacing: 8px;
 
-                // Falls die Pfeile bei dir als Kästchen erscheinen, ersetze sie durch "^" und "v"
                 Text { text: root.expanded ? "▼" : "▲"; color: #a0a8b5; vertical-alignment: center; font-size: 11px; }
                 Text {
                     text: "Laufende Instanzen (" + root.instances.length + ")";
@@ -212,6 +320,25 @@ component RunningBar inherits Rectangle {
                         horizontal-stretch: 1;
                     }
 
+                    // NEU: Console-Button (blau), links vom Force-Stop
+                    Rectangle {
+                        width: 80px;
+                        height: 24px;
+                        border-radius: 4px;
+                        background: console_area.pressed ? #203050 : (console_area.has-hover ? #4a6090 : #3a5070);
+
+                        console_area := TouchArea { clicked => { root.open_console(inst.name); } }
+
+                        Text {
+                            text: "Console";
+                            color: white;
+                            font-size: 12px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
                     // Eigener roter Button (der Standard-Button lässt sich nicht einfärben), ganz rechts
                     Rectangle {
                         width: 90px;
@@ -237,9 +364,13 @@ component RunningBar inherits Rectangle {
 }
 
 // Rahmen für eine Karte im Misc-Popup: Titel, optionaler Hinweistext, darunter beliebiger Inhalt.
+// Rahmen für eine Karte im Misc-Popup: Titel, optionaler Hinweistext, darunter beliebiger Inhalt.
+// hint_height ist fest, weil Slint die Höhe von umbrochenem Text in Layouts nicht
+// breitenabhängig berechnet (sonst überlappen Karten bei schmalen Fenstern).
 component MiscCard inherits Rectangle {
     in property <string> title;
     in property <string> hint;
+    in property <length> hint_height: 34px; // ca. 2 Zeilen; bei langen Hints pro Karte erhöhen
     background: #232c3a;
     border-radius: 6px;
 
@@ -247,8 +378,174 @@ component MiscCard inherits Rectangle {
         padding: 12px;
         spacing: 8px;
         Text { text: root.title; color: white; font-weight: 700; font-size: 14px; }
-        if root.hint != "" : Text { text: root.hint; color: #a0a8b5; font-size: 12px; wrap: word-wrap; }
+        if root.hint != "" : Text {
+            text: root.hint;
+            color: #a0a8b5;
+            font-size: 12px;
+            wrap: word-wrap;
+            height: root.hint_height;
+            vertical-alignment: top;
+            overflow: elide;
+        }
         @children
+    }
+}
+
+component AchievementCard inherits Rectangle {
+    in property <string> title;
+    in property <string> description;
+    in property <string> meta;
+    in property <string> kind;
+    in property <image> icon;
+    in property <bool> is_new: false;
+
+    height: 84px;
+    background: #232c3a;
+    border-radius: 8px;
+    border-width: 2px;
+    border-color: root.is_new ? #1bd96a : #2c3747;
+
+    HorizontalLayout {
+        padding: 10px;
+        spacing: 12px;
+
+        Rectangle {
+            width: 52px;
+            height: 52px;
+            border-radius: 8px;
+            background: #1b2330;
+
+            Text {
+                text: root.kind == "challenge" ? "★" : (root.kind == "goal" ? "◆" : "●");
+                color: root.kind == "challenge" ? #c792ea : (root.kind == "goal" ? #4da3ff : #7bdc8a);
+                font-size: 26px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            Image {
+                source: root.icon;
+                width: 40px;
+                height: 40px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+
+        VerticalLayout {
+            spacing: 2px;
+            horizontal-stretch: 1;
+            Text { text: root.title; color: root.is_new ? #7bdc8a : white; font-size: 16px; font-weight: 800; overflow: elide; height: 22px; }
+            Text { text: root.description; color: #a0a8b5; font-size: 12px; overflow: elide; height: 18px; }
+            Text { text: root.meta; color: #7a8291; font-size: 10px; overflow: elide; height: 14px; }
+        }
+    }
+}
+
+// Vollbild-Overlay beim Spielstart: Karte mit hüpfenden Blöcken, großem Status-Text
+// und animierter Loading-Bar. Die Animation läuft über einen Timer (t zählt hoch),
+// weil das in jeder Slint-Version zuverlässig funktioniert.
+// Die Komponente wird nur per "if" erzeugt, t startet also bei jedem Start bei 0.
+component LaunchOverlay inherits Rectangle {
+    in property <string> instance;
+    in property <string> status;
+    in property <float> progress;
+    in-out property <int> t: 0;
+
+    // 0 -> 1 in ca. 0,3 s: für das Einblenden und Hochgleiten der Karte
+    property <float> appear: min(1.0, root.t / 10.0);
+
+    background: #000000cc;
+    opacity: root.appear;
+
+    Timer {
+        interval: 30ms;
+        running: true;
+        triggered => { root.t += 1; }
+    }
+
+    TouchArea {} // blockt Klicks auf alles dahinter
+
+    Rectangle {
+        width: min(620px, parent.width - 40px);
+        height: 340px;
+        x: parent.width / 2 - self.width / 2;
+        y: parent.height / 2 - self.height / 2 + (1.0 - root.appear) * 30px;
+        background: #1f2937;
+        border-radius: 16px;
+        drop-shadow-blur: 30px;
+        drop-shadow-color: #000000aa;
+
+        VerticalLayout {
+            padding: 28px;
+            spacing: 14px;
+
+            Text {
+                text: "Starte " + root.instance;
+                color: #a0a8b5;
+                font-size: 14px;
+                horizontal-alignment: center;
+                overflow: elide;
+                height: 20px;
+            }
+
+            // Drei hüpfende Blöcke (grün / blau / orange), jeder leicht phasenversetzt
+            Rectangle {
+                height: 48px;
+                for i in 3 : Rectangle {
+                    x: parent.width / 2 - 33px + i * 26px;
+                    y: 28px - 24px * max(0.0, sin(root.t * 14deg - i * 50deg));
+                    width: 16px;
+                    height: 16px;
+                    border-radius: 4px;
+                    background: i == 0 ? #1bd96a : (i == 1 ? #4da3ff : #ff9a2e);
+                }
+            }
+
+            // Der große Status-Text: sagt, was gerade passiert
+            Text {
+                text: root.status;
+                color: white;
+                font-size: 26px;
+                font-weight: 800;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                vertical-stretch: 1;
+                overflow: elide;
+            }
+
+            // Loading-Bar mit Farbverlauf + Glanz, der über den gefüllten Teil wandert
+            Rectangle {
+                height: 18px;
+                border-radius: 9px;
+                background: #0f1520;
+                clip: true;
+
+                Rectangle {
+                    width: max(18px, parent.width * root.progress);
+                    height: parent.height;
+                    border-radius: 9px;
+                    background: @linear-gradient(90deg, #1bd96a 0%, #4da3ff 100%);
+                    clip: true;
+                    animate width { duration: 400ms; easing: ease-out; }
+
+                    Rectangle {
+                        width: 70px;
+                        height: parent.height;
+                        x: (mod(root.t * 5.0, parent.width / 1px + 70.0) - 70.0) * 1px;
+                        background: @linear-gradient(90deg, #ffffff00 0%, #ffffff55 50%, #ffffff00 100%);
+                    }
+                }
+            }
+
+            Text {
+                text: round(root.progress * 100) + " %";
+                color: #7a8291;
+                font-size: 12px;
+                horizontal-alignment: center;
+                height: 16px;
+            }
+        }
     }
 }
 
@@ -259,10 +556,14 @@ export component AppWindow inherits Window {
     callback create_and_run(string, string, string);
     callback browser_search(string, string); // query, source
     callback save_settings(int, string, string, bool, bool, bool, int, bool);
+    callback apply_device_tier(string, bool); // choice, auch Icons recachen?
     callback browser_open_install(string, string, string); // project_id, pack_name, source <-- GEÄNDERT
     callback browser_confirm_install(int);
     callback import_mrpack(string);
     callback import_cf_zip(string); // <-- NEU: Für den .zip Import
+
+    // Feature 6: Favoriten toggeln. kind = "instances" | "modpacks" | "mods"
+    callback toggle_favorite(string, string);
 
     callback compat_toggle_action(string);
     callback compat_apply(string); // instance_name
@@ -286,6 +587,8 @@ export component AppWindow inherits Window {
     callback account_microsoft_open_browser();
     callback account_microsoft_submit(string); // eingefügte Adresse bzw. Code
     callback force_stop(string); // instance_name -> beendet den laufenden Prozess
+    callback console_open(string); // Live-Konsole für eine Instanz öffnen
+    callback console_close();      // Live-Konsole schließen
 
     // Spielzeit: "pure" = reine Abfrage. Das int-Argument (playtime_tick) erzwingt die Neuberechnung nach einer Session.
     pure callback instance_playtime(string, int) -> string;
@@ -295,7 +598,9 @@ export component AppWindow inherits Window {
     callback misc_env_add(string, string, string);            // instance, name, value
     callback misc_env_remove(string, int);                    // instance, index
     callback misc_wrapper_toggle(string, string, bool);       // instance, wrapper_id, enabled
-    callback detail_save_quick(string, bool, string, string); // instance, enabled, server, world
+    callback world_play(string, string);    // instance_name, folder_name
+    callback server_join(string, string);   // instance_name, server_ip
+    callback refresh_servers(string);       // instance_name -> Ping alle Server
     callback detail_filter_mods(string, string);              // instance, suchtext
     // Manage Instanz (Block 3)
     callback manage_open(string);
@@ -304,7 +609,81 @@ export component AppWindow inherits Window {
     callback manage_export(string);
     callback manage_delete(string);
     callback manage_loader_check(string, string);             // instance, Ziel-Version -> Resolver-Test, dann Bestätigung
+    callback create_shortcut(string);
+    // Presets (Neue Features 3)
+    callback preset_new_start();
+    callback preset_new_set_mc(string);
+    callback preset_new_set_loader(string);
+    callback preset_new_add_mod_search(string);
+    callback preset_new_add_mod(string, string);
+    callback preset_new_remove_mod(string);
+    callback preset_new_save();
+    callback preset_select(string);
+    callback preset_delete(string);
+    callback preset_apply(string, string); // preset_id, instance_name
     callback manage_loader_latest(string);
+    // Features: Update, Exporte, Werkzeuge, Statistik
+    callback manage_update_load(string);        // instance -> Versionsliste laden
+    callback manage_update_check(string, int);  // instance, Index der gewählten Version
+    callback manage_update_apply(string);       // instance
+    callback manage_update_from_file(string, string); // instance, Pfad zur .mrpack
+    callback update_confirm(string);            // instance (Konflikt-Popup im Modus "update")
+    callback manage_export_mrpack(string);
+    callback server_pack_export(string, bool, string); // instance, als Server hinzufügen?, Servername
+    callback orphans_scan(string);
+    callback stats_open();
+
+        // ---- Absturz-Analyse ----
+    callback crash_analyze(string);                 // instance
+    callback crash_disable_mod(string, string);     // instance, Dateiname
+    callback crash_open_report(string);             // instance
+    in-out property <bool> crash_popup_visible: false;
+    in-out property <string> crash_instance: "";
+    in-out property <string> crash_summary: "";
+    in-out property <string> crash_status: "";
+    in property <[CrashFindingUi]> crash_findings;
+
+    // ---- Server-Pack-Popup (fragt vor dem Export) ----
+    in-out property <bool> sp_popup_visible: false;
+    in-out property <bool> sp_add: true;
+    in-out property <string> sp_name: "";
+
+    // ---- Server-Tab ----
+    callback srv_open();
+    callback srv_select(string);
+    callback srv_create(string, string, string);    // name, mc-version, loader
+    callback srv_start(string);
+    callback srv_stop(string);
+    callback srv_kill(string);
+    callback srv_command(string, string);           // server, befehl
+    callback srv_save(string, int, bool, string, string, string, string, bool, bool); // name, ram_mb, eula, port, max, motd, difficulty, whitelist, online
+    callback srv_delete(string);
+    callback srv_open_folder(string);
+    in property <[LocalServerUi]> srv_list;
+    in-out property <string> srv_selected: "";
+    in-out property <string> srv_status: "";
+    in-out property <float> srv_ram_gb: 2;
+    in-out property <bool> srv_eula: false;
+    in-out property <string> srv_prop_port: "25565";
+    in-out property <string> srv_prop_max: "20";
+    in-out property <string> srv_prop_motd: "";
+    in-out property <string> srv_prop_difficulty: "normal";
+    in-out property <bool> srv_prop_whitelist: false;
+    in-out property <bool> srv_prop_online: true;
+    in property <[string]> srv_console_lines;
+    in-out property <int> srv_console_tick: 0;
+    in-out property <bool> srv_autoscroll: true;
+    in-out property <bool> srv_confirm_delete: false;
+
+    in property <[string]> manage_update_versions;
+    in-out property <bool> manage_update_supported: false;
+    in-out property <bool> manage_update_pending: false;
+    in-out property <string> manage_update_report: "";
+    in-out property <string> misc_tools_status: "";
+    in property <string> stats_summary;
+    in property <[StatRowUi]> stats_instances;
+    in property <[StatRowUi]> stats_days;
+    in property <[StatRowUi]> stats_startups;
     // Doppelte Mods (Block 4)
     callback duplicates_fix(string);
     callback duplicates_apply(string);               // instance -> bestätigte Vorschläge anwenden
@@ -316,6 +695,19 @@ export component AppWindow inherits Window {
     // Vars
     in-out property <bool> popup_new_instance: false;
     in-out property <string> selected_panel: "Instanzen";
+    in property <[PresetUi]> presets_list;
+    in-out property <string> presets_status: "";
+    in-out property <string> preset_new_name: "";
+    in-out property <string> preset_new_mc: "";
+    in-out property <string> preset_new_loader: "fabric";
+    in-out property <string> preset_new_loader_version: "";
+    in property <[PresetModUi]> preset_new_mods;
+    in-out property <bool> preset_add_mod_popup_visible: false;
+    in property <[BrowserPackInfo]> preset_add_mod_results;
+    in-out property <string> preset_selected_id: "";
+    in-out property <string> preset_apply_instance: "";
+    in property <[ModpackInfo]> preset_apply_targets;
+    in property <[string]> preset_apply_targets_names;
     in property <[ModpackInfo]> packs;
     in property <[string]> mcVersions;
     in property <[BrowserPackInfo]> browser_packs; // Ergebnisse der Modrinth-Suche
@@ -373,17 +765,41 @@ export component AppWindow inherits Window {
     // Anzeige-Einstellungen
     in-out property <int> items_per_page: 12;
     in-out property <bool> debug_ui: false;
+    in-out property <string> settings_device_tier: "auto";
+    in-out property <bool> recache_popup_visible: false;
+    in-out property <string> recache_status: "";
+    in-out property <float> recache_progress: 0.0;
     in property <[string]> debug_log;
     // Laufende Instanzen (von Rust befüllt) + Zustand der unteren Leiste
     in property <[RunningInstance]> running_instances;
     in-out property <bool> running_bar_expanded: false;
 
+    // Live-Konsole
+    in-out property <bool> console_popup_visible: false;
+    in-out property <string> console_instance_name: "";
+    in property <[string]> console_lines;
+    in-out property <bool> console_auto_scroll: true;
+    in-out property <int> console_scroll_tick: 0;
+
     in-out property <int> playtime_tick: 0;
+
+    callback achievements_open();
+    callback achievements_toggle(string); // Instanzname -> Gruppe ein-/ausklappen
+    in property <[AchievementUi]> achievements_recent;
+    in property <[AchievementUi]> achievements_all;
+    in property <string> achievements_summary: "";
+
+    // Start-Popup (Rust steuert Sichtbarkeit, Text und Fortschritt)
+    in-out property <bool> launch_popup_visible: false;
+    in-out property <string> launch_instance: "";
+    in-out property <string> launch_status: "";
+    in-out property <float> launch_progress: 0.0;
+
     in-out property <string> mod_filter: "";
     // Misc
     in-out property <string> misc_jvm_args: "";
     in-out property <string> misc_preset_id: "none";
-    in property <[PresetUi]> misc_presets;
+    in property <[JvmPresetUi]> misc_presets;
     in property <string> misc_suggestion: "";
     in property <[EnvVarUi]> misc_env_vars;
     in property <[WrapperUi]> misc_wrappers;
@@ -394,10 +810,11 @@ export component AppWindow inherits Window {
     in-out property <bool> misc_auto_fix_dupes: false;
     in-out property <string> misc_status: "";
     // Quick-Connect (Detailansicht)
-    in-out property <bool> detail_quick_enabled: false;
-    in-out property <string> detail_quick_server: "";
-    in-out property <string> detail_quick_world: "";
-    in property <bool> detail_quick_supported: true;
+    // Feature 14: Welten + Server statt Quick-Connect
+    in property <[WorldInfoUi]> detail_worlds;
+    in property <[ServerInfoUi]> detail_servers;
+    in-out property <string> detail_worlds_status: "";
+    in-out property <string> detail_servers_status: "";
     // Doppelte Mods + Manage Instanz
     in property <[DuplicateUi]> detail_duplicates;
     in-out property <bool> manage_popup_visible: false;
@@ -479,6 +896,74 @@ export component AppWindow inherits Window {
                             color: root.selected_panel == "Modpack Browser" ? red : white;
                         }
                     }
+
+                    
+                                        TouchArea {
+                        width: 100%;
+                        height: 50px;
+                        clicked => {
+                            root.selected_panel = "Presets";
+                            root.preset_new_start();
+                        }
+                        Text {
+                            text: "Presets";
+                            horizontal-alignment: center;
+                            font-size: 13px;
+                            font-weight: 900;
+                            wrap: word-wrap;
+                            color: root.selected_panel == "Presets" ? red : white;
+                        }
+                    }
+
+                    TouchArea {
+                        width: 100%;
+                        height: 50px;
+                        clicked => {
+                            root.selected_panel = "Server";
+                            root.srv_open();
+                        }
+                        Text {
+                            text: "Server";
+                            horizontal-alignment: center;
+                            font-size: 13px;
+                            font-weight: 900;
+                            color: root.selected_panel == "Server" ? red : white;
+                        }
+                    }
+
+                    TouchArea {
+                        width: 100%;
+                        height: 50px;
+                        clicked => {
+                            root.selected_panel = "Statistik";
+                            root.stats_open();
+                        }
+                        Text {
+                            text: "Statistik";
+                            horizontal-alignment: center;
+                            font-size: 13px;
+                            font-weight: 900;
+                            color: root.selected_panel == "Statistik" ? red : white;
+                        }
+                    }
+
+                    TouchArea {
+                        width: 100%;
+                        height: 50px;
+                        clicked => {
+                            root.selected_panel = "Achievements";
+                            root.achievements_open();
+                        }
+                        Text {
+                            text: "Achievements";
+                            horizontal-alignment: center;
+                            font-size: 13px;
+                            font-weight: 900;
+                            wrap: word-wrap;
+                            color: root.selected_panel == "Achievements" ? red : white;
+                        }
+                    }
+
                     TouchArea {
                         width: 100%;
                         height: 50px;
@@ -557,9 +1042,11 @@ export component AppWindow inherits Window {
                                 name: pack.name;
                                 playtime: root.instance_playtime(pack.name, root.playtime_tick);
                                 icon: pack.icon;
+                                starred: pack.starred;
                                 background: #333;
                                 modpack_play(n) => { root.modpack_play(n) }
                                 modpack_details(n) => { root.open_instance_details(n) }
+                                toggle_star(n) => { root.toggle_favorite("instances", n) }
                             }
                         }
                     }
@@ -617,7 +1104,9 @@ export component AppWindow inherits Window {
                                 author: pack.author;
                                 icon: pack.icon;
                                 source: pack.source;
+                                starred: pack.starred;
                                 install_clicked(id, n, src) => { root.browser_open_install(id, n, src) }
+                                toggle_star(id) => { root.toggle_favorite("modpacks", id) }
                             }
                         }
                     }
@@ -662,10 +1151,10 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         spacing: 10px;
                         max-height: 30px;
-                        Text { text: "Java-Pfad"; color: white; vertical-alignment: center; width: 180px; }
+                        Text { text: "Java-Version"; color: white; vertical-alignment: center; width: 180px; }
                         ComboBox {
                             model: root.available_java_paths;
-                            current-value <=> root.detail_java_selection;
+                            current-value <=> root.java_path;
                         }
                     }
 
@@ -690,9 +1179,50 @@ export component AppWindow inherits Window {
                     }
                     debug_ui_box := CheckBox { text: "Debug-UI anzeigen"; checked: root.debug_ui; }
 
+                    Rectangle { height: 10px; }
+
+                    Text { text: "Performance"; font-size: 18px; font-weight: 700; color: white; }
+
+                    HorizontalLayout {
+                        spacing: 10px;
+                        max-height: 30px;
+                        Text { text: "Device-Tier"; color: white; vertical-alignment: center; width: 180px; }
+                        ComboBox {
+                            model: ["auto", "low", "mid", "high"];
+                            current-value <=> root.settings_device_tier;
+                        }
+                        Text {
+                            text: "(aktuell: " + (root.settings_device_tier == "auto" ? "auto erkannt" : root.settings_device_tier) + ")";
+                            color: #7a8291;
+                            vertical-alignment: center;
+                            font-size: 12px;
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        max-height: 30px;
+                        Text { text: ""; width: 180px; }
+                        Button {
+                            text: "Apply & Icons neu cachen";
+                            width: 220px;
+                            clicked => { root.apply_device_tier(root.settings_device_tier, true); }
+                        }
+                        Button {
+                            text: "Nur speichern";
+                            width: 130px;
+                            clicked => { root.apply_device_tier(root.settings_device_tier, false); }
+                        }
+                    }
+                    Text {
+                        text: "Tier beeinflusst Icon-Größe (64/96/128), Log-Puffer, Download-Parallelität.";
+                        color: #7a8291;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+
                     Text { text: "Launcher"; font-size: 18px; font-weight: 700; color: white; }
 
-                    close_after_launch_box := CheckBox { text: "Launcher nach Spielstart schließen"; checked: root.close_after_launch; }
+                    close_after_launch_box := CheckBox { text: "Launcher beim Spielen minimieren (Tray) und danach wieder öffnen"; checked: root.close_after_launch; }
                     open_on_startup_box := CheckBox { text: "Beim Systemstart öffnen"; checked: root.open_on_startup; }
                     show_snapshots_box := CheckBox { text: "Snapshot-Versionen anzeigen"; checked: root.show_snapshots; }
 
@@ -724,6 +1254,549 @@ export component AppWindow inherits Window {
                                 root.items_per_page,
                                 root.debug_ui,
                             );
+                        }
+                    }
+                }
+
+                                if selected_panel == "Presets" : VerticalLayout {
+                    padding: 20px;
+                    spacing: 12px;
+
+                    Text { text: "Presets"; font-size: 18px; font-weight: 700; color: white; }
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        vertical-stretch: 1;
+
+                        // Linke Spalte: Liste der Presets
+                        VerticalLayout {
+                            width: 250px;
+                            spacing: 6px;
+
+                            Text { text: "Meine Presets"; color: white; font-weight: 700; font-size: 14px; }
+                            if root.presets_status != "" : Text { text: root.presets_status; color: #a0a8b5; font-size: 11px; wrap: word-wrap; }
+
+                            ScrollView {
+                                vertical-stretch: 1;
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    for p in root.presets_list : Rectangle {
+                                        height: 50px;
+                                        background: root.preset_selected_id == p.id ? #2c4a66 : #1e2632;
+                                        border-radius: 4px;
+
+                                        preset_area := TouchArea { clicked => { root.preset_select(p.id); } }
+
+                                        VerticalLayout {
+                                            padding: 6px;
+                                            spacing: 2px;
+                                            Text { text: p.name; color: white; font-weight: 700; font-size: 13px; overflow: elide; }
+                                            Text { text: p.mc_version + " · " + p.loader + " · " + p.mod_count + " Mods"; color: #7a8291; font-size: 10px; }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Rechte Spalte: Detail / Neu erstellen
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            spacing: 8px;
+
+                            Text { text: "Neues Preset erstellen"; color: white; font-weight: 700; font-size: 14px; }
+
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                Text { text: "Name:"; color: white; width: 80px; vertical-alignment: center; }
+                                preset_name_box := LineEdit {
+                                    placeholder-text: "z.B. Vanilla+ Performance";
+                                    text <=> root.preset_new_name;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                Text { text: "MC-Version:"; color: white; width: 80px; vertical-alignment: center; }
+                                preset_mc_box := ComboBox {
+                                    model: root.mcVersions;
+                                    current-value <=> root.preset_new_mc;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                Text { text: "Loader:"; color: white; width: 80px; vertical-alignment: center; }
+                                ComboBox {
+                                    model: ["vanilla", "fabric", "forge", "neoforge", "quilt"];
+                                    current-value <=> root.preset_new_loader;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                Text { text: "Mods (" + root.preset_new_mods.length + "):"; color: white; width: 80px; vertical-alignment: center; }
+                                Button {
+                                    text: "+ Mod hinzufügen";
+                                    width: 140px;
+                                    clicked => {
+                                        root.preset_add_mod_popup_visible = true;
+                                        root.preset_new_add_mod_search("");
+                                    }
+                                }
+                            }
+
+                            ScrollView {
+                                height: 120px;
+                                VerticalLayout {
+                                    spacing: 2px;
+                                    for m in root.preset_new_mods : HorizontalLayout {
+                                        height: 24px;
+                                        spacing: 8px;
+                                        Image { source: m.icon; width: 18px; height: 18px; }
+                                        Text { text: m.project_name; color: white; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                                        Button {
+                                            text: "Entfernen";
+                                            width: 90px;
+                                            height: 20px;
+                                            clicked => { root.preset_new_remove_mod(m.project_id); }
+                                        }
+                                    }
+                                }
+                            }
+
+                            Rectangle { height: 4px; }
+
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                Button {
+                                    text: "Preset speichern";
+                                    primary: true;
+                                    width: 160px;
+                                    clicked => { root.preset_new_save(); }
+                                }
+                                Button {
+                                    text: "Preset löschen";
+                                    width: 140px;
+                                    enabled: root.preset_selected_id != "";
+                                    clicked => { root.preset_delete(root.preset_selected_id); }
+                                }
+                            }
+
+                            Rectangle { height: 4px; }
+
+                            Text { text: "Preset auf Instanz anwenden"; color: white; font-weight: 700; font-size: 14px; }
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                ComboBox {
+                                    model: root.preset_apply_targets_names; // reuse: enthält keine Instanzen... wir bauen das anders
+                                    // Wir nutzen stattdessen die Instanznamen aus packs
+                                    current-value <=> root.preset_apply_instance;
+                                    horizontal-stretch: 1;
+                                    // Model ist falsch — siehe Rust-Callback. Wird durch preset_apply_targets befüllt.
+                                }
+                                Button {
+                                    text: "Anwenden";
+                                    width: 120px;
+                                    enabled: root.preset_selected_id != "" && root.preset_apply_instance != "";
+                                    clicked => { root.preset_apply(root.preset_selected_id, root.preset_apply_instance); }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                                if selected_panel == "Achievements" : ScrollView {
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 8px;
+                        alignment: start;
+
+                        Text { text: "Achievements"; font-size: 18px; font-weight: 700; color: white; }
+                        Text { text: root.achievements_summary; color: #7bdc8a; font-size: 12px; }
+
+                        Text { text: "Neueste 5"; font-size: 14px; font-weight: 700; color: white; }
+                        if root.achievements_recent.length == 0 : Text {
+                            text: "Noch keine Achievements erfasst. Sie werden nach dem Beenden von Minecraft aus der latest.log gelesen.";
+                            color: #7a8291;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        for a in root.achievements_recent : AchievementCard {
+                            title: a.title_big;
+                            description: a.description;
+                            meta: a.meta;
+                            kind: a.kind;
+                            icon: a.icon;
+                            is_new: a.is_new;
+                        }
+
+                        Rectangle { height: 10px; }
+                        Text { text: "Pro Modpack / Instanz  (grün = aus der letzten Session)"; font-size: 14px; font-weight: 700; color: white; }
+
+                                                for a in root.achievements_all : VerticalLayout {
+                            spacing: 2px;
+
+                            // Blaue Überschrift: Klick klappt die Gruppe ein/aus
+                            if a.header != "" : Rectangle {
+                                height: 34px;
+                                header_area := TouchArea {
+                                    clicked => { root.achievements_toggle(a.instance); }
+                                }
+                                Text {
+                                    text: a.header;
+                                    color: header_area.has-hover ? #7dbbff : #4da3ff;
+                                    font-size: 15px;
+                                    font-weight: 800;
+                                    vertical-alignment: bottom;
+                                }
+                            }
+
+                            // Zeile: "Welt/Server - Achievement" in grün, Zeit rechts
+                            if !a.collapsed : HorizontalLayout {
+                                height: 22px;
+                                spacing: 10px;
+                                Text {
+                                    text: a.line;
+                                    color: #7bdc8a;
+                                    font-weight: a.is_new ? 800 : 400;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                }
+                                Text { text: a.short; color: #7a8291; font-size: 10px; vertical-alignment: center; horizontal-alignment: right; width: 100px; overflow: elide; }
+                            }
+                        }
+                    }
+                }
+
+                if selected_panel == "Statistik" : ScrollView {
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 10px;
+                        alignment: start;
+
+                        Text { text: "Statistik"; font-size: 18px; font-weight: 700; color: white; }
+                        Text { text: root.stats_summary; color: #7bdc8a; wrap: word-wrap; }
+
+                        Text { text: "Spielzeit pro Instanz"; font-size: 14px; font-weight: 700; color: white; }
+                        for r in root.stats_instances : HorizontalLayout {
+                            height: 22px;
+                            spacing: 8px;
+                            Text { text: r.name; width: 220px; color: white; vertical-alignment: center; overflow: elide; }
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                Rectangle {
+                                    width: parent.width * r.fraction;
+                                    height: 14px;
+                                    y: parent.height / 2 - 7px;
+                                    background: #1bd96a;
+                                    border-radius: 3px;
+                                }
+                            }
+                            Text { text: r.text; width: 120px; color: #a0a8b5; vertical-alignment: center; font-size: 12px; }
+                        }
+
+                        Rectangle { height: 6px; }
+                        Text { text: "Letzte 7 Tage"; font-size: 14px; font-weight: 700; color: white; }
+                        for r in root.stats_days : HorizontalLayout {
+                            height: 22px;
+                            spacing: 8px;
+                            Text { text: r.name; width: 220px; color: white; vertical-alignment: center; }
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                Rectangle {
+                                    width: parent.width * r.fraction;
+                                    height: 14px;
+                                    y: parent.height / 2 - 7px;
+                                    background: #4da3ff;
+                                    border-radius: 3px;
+                                }
+                            }
+                            Text { text: r.text; width: 120px; color: #a0a8b5; vertical-alignment: center; font-size: 12px; }
+                        }
+
+                        Rectangle { height: 6px; }
+                        Text { text: "Startzeit bis Hauptmenü (pro Instanz und JVM-Preset)"; font-size: 14px; font-weight: 700; color: white; }
+                        if root.stats_startups.length == 0 : Text {
+                            text: "Noch keine Messung. Starte eine Instanz, die Zeit wird automatisch erfasst.";
+                            color: #7a8291;
+                            font-size: 12px;
+                        }
+                        for r in root.stats_startups : HorizontalLayout {
+                            height: 22px;
+                            spacing: 8px;
+                            Text { text: r.name; width: 220px; color: white; vertical-alignment: center; overflow: elide; }
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                Rectangle {
+                                    width: parent.width * r.fraction;
+                                    height: 14px;
+                                    y: parent.height / 2 - 7px;
+                                    background: #ff9a2e;
+                                    border-radius: 3px;
+                                }
+                            }
+                            Text { text: r.text; width: 230px; color: #a0a8b5; vertical-alignment: center; font-size: 12px; }
+                        }
+                    }
+                }
+
+                                if selected_panel == "Server" : HorizontalLayout {
+                    padding: 20px;
+                    spacing: 16px;
+
+                    // ---------- Linke Spalte: Serverliste + "Neuer Server" ----------
+                    VerticalLayout {
+                        width: 270px;
+                        spacing: 8px;
+
+                        Text { text: "Server"; font-size: 18px; font-weight: 700; color: white; }
+
+                        ScrollView {
+                            vertical-stretch: 1;
+                            VerticalLayout {
+                                spacing: 4px;
+                                alignment: start;
+
+                                if root.srv_list.length == 0 : Text {
+                                    text: "Noch keine Server. Lege unten einen an oder exportiere ein Server-Pack (Misc-Popup).";
+                                    color: #7a8291;
+                                    font-size: 11px;
+                                    wrap: word-wrap;
+                                    height: 50px;
+                                }
+
+                                for s in root.srv_list : Rectangle {
+                                    height: 48px;
+                                    background: root.srv_selected == s.name ? #2c4a66 : #1e2632;
+                                    border-radius: 4px;
+
+                                    TouchArea { clicked => { root.srv_select(s.name); } }
+
+                                    HorizontalLayout {
+                                        padding: 6px;
+                                        spacing: 8px;
+                                        // grüner Punkt = läuft
+                                        Rectangle {
+                                            width: 10px;
+                                            height: 10px;
+                                            border-radius: 5px;
+                                            y: parent.height / 2 - 5px;
+                                            background: s.running ? #1bd96a : #7a8291;
+                                        }
+                                        VerticalLayout {
+                                            spacing: 2px;
+                                            horizontal-stretch: 1;
+                                            Text { text: s.name; color: white; font-weight: 700; font-size: 13px; overflow: elide; }
+                                            Text {
+                                                text: s.mc_version + " · " + s.loader + " · Port " + s.port
+                                                    + (s.installed ? "" : " · nicht installiert")
+                                                    + (s.port_conflict ? " · ⚠ Port doppelt" : "");
+                                                color: s.port_conflict ? #ff9a2e : #7a8291;
+                                                font-size: 10px;
+                                                overflow: elide;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            height: 200px;
+                            background: #232c3a;
+                            border-radius: 6px;
+
+                            VerticalLayout {
+                                padding: 10px;
+                                spacing: 6px;
+                                Text { text: "Neuer Server"; color: white; font-weight: 700; font-size: 13px; }
+                                srv_new_name := LineEdit { placeholder-text: "Servername"; }
+                                srv_new_mc := ComboBox { model: root.mcVersions; }
+                                srv_new_loader := ComboBox { model: ["vanilla", "fabric", "forge", "neoforge"]; }
+                                Button {
+                                    text: "Server anlegen";
+                                    clicked => {
+                                        root.srv_create(srv_new_name.text, srv_new_mc.current-value, srv_new_loader.current-value);
+                                        srv_new_name.text = "";
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ---------- Rechte Spalte: Details ----------
+                    if root.srv_selected == "" : Text {
+                        text: "Wähle links einen Server aus.";
+                        color: #7a8291;
+                        horizontal-stretch: 1;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    if root.srv_selected != "" : ScrollView {
+                        horizontal-stretch: 1;
+
+                        VerticalLayout {
+                            spacing: 10px;
+                            alignment: start;
+
+                            // Kopfzeile mit Steuerung
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                Text { text: root.srv_selected; font-size: 20px; font-weight: 900; color: white; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                                Button { text: "Start"; primary: true; width: 80px; clicked => { root.srv_start(root.srv_selected); } }
+                                Button { text: "Stop"; width: 80px; clicked => { root.srv_stop(root.srv_selected); } }
+                                Button { text: "Kill"; width: 70px; clicked => { root.srv_kill(root.srv_selected); } }
+                                Button { text: "Ordner"; width: 80px; clicked => { root.srv_open_folder(root.srv_selected); } }
+                            }
+
+                            if root.srv_status != "" : Text {
+                                text: root.srv_status;
+                                color: #a0d8a0;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                                height: 34px;
+                                vertical-alignment: top;
+                                overflow: elide;
+                            }
+
+                            // Konsole mit Befehlseingabe
+                            Rectangle {
+                                height: 300px;
+                                background: #1a1e26;
+                                border-radius: 6px;
+
+                                VerticalLayout {
+                                    padding: 8px;
+                                    spacing: 6px;
+
+                                    srv_console_scroll := ScrollView {
+                                        vertical-stretch: 1;
+                                        property <int> observe_tick: root.srv_console_tick;
+                                        changed observe_tick => {
+                                            if (root.srv_autoscroll) { self.content-y = 1000000px; }
+                                        }
+
+                                        VerticalLayout {
+                                            spacing: 1px;
+                                            if root.srv_console_lines.length == 0 : Text {
+                                                text: "(Noch keine Ausgabe. Starte den Server.)";
+                                                color: #7a8291;
+                                                font-size: 11px;
+                                            }
+                                            for line in root.srv_console_lines : Text {
+                                                text: line;
+                                                color: #dddddd;
+                                                font-size: 11px;
+                                                wrap: no-wrap;
+                                            }
+                                        }
+                                    }
+
+                                    HorizontalLayout {
+                                        height: 28px;
+                                        spacing: 8px;
+                                        srv_cmd_box := LineEdit {
+                                            placeholder-text: "Befehl, z.B. op Name  (ohne /)";
+                                            accepted(t) => { root.srv_command(root.srv_selected, t); srv_cmd_box.text = ""; }
+                                        }
+                                        Button { text: "Senden"; width: 80px; clicked => { root.srv_command(root.srv_selected, srv_cmd_box.text); srv_cmd_box.text = ""; } }
+                                        CheckBox { text: "Auto-Scroll"; checked <=> root.srv_autoscroll; }
+                                    }
+                                }
+                            }
+
+                            // Einstellungen
+                            MiscCard {
+                                title: "Einstellungen";
+                                hint: "Änderungen gelten beim nächsten Start. Zwei Server dürfen nicht denselben Port nutzen, wenn sie gleichzeitig laufen.";
+                                hint_height: 34px;
+
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    height: 26px;
+                                    Text { text: "RAM"; color: white; vertical-alignment: center; width: 110px; }
+                                    Slider { minimum: 1; maximum: 32; value <=> root.srv_ram_gb; horizontal-stretch: 1; }
+                                    Text { text: round(root.srv_ram_gb) + " GB"; color: white; vertical-alignment: center; width: 60px; }
+                                }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    height: 28px;
+                                    Text { text: "Port"; color: white; vertical-alignment: center; width: 110px; }
+                                    LineEdit { text <=> root.srv_prop_port; width: 100px; }
+                                    Text { text: "Max. Spieler"; color: white; vertical-alignment: center; width: 100px; }
+                                    LineEdit { text <=> root.srv_prop_max; width: 80px; }
+                                }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    height: 28px;
+                                    Text { text: "MOTD"; color: white; vertical-alignment: center; width: 110px; }
+                                    LineEdit { text <=> root.srv_prop_motd; horizontal-stretch: 1; }
+                                }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    height: 28px;
+                                    Text { text: "Schwierigkeit"; color: white; vertical-alignment: center; width: 110px; }
+                                    ComboBox { model: ["peaceful", "easy", "normal", "hard"]; current-value <=> root.srv_prop_difficulty; width: 160px; }
+                                }
+                                HorizontalLayout {
+                                    spacing: 16px;
+                                    height: 28px;
+                                    CheckBox { text: "Whitelist"; checked <=> root.srv_prop_whitelist; }
+                                    CheckBox { text: "Online-Modus (Account-Prüfung)"; checked <=> root.srv_prop_online; }
+                                }
+                                CheckBox { text: "Ich akzeptiere die Minecraft-EULA (aka.ms/MinecraftEULA)"; checked <=> root.srv_eula; }
+                                Button {
+                                    text: "Speichern";
+                                    primary: true;
+                                    width: 140px;
+                                    clicked => {
+                                        root.srv_save(
+                                            root.srv_selected,
+                                            round(root.srv_ram_gb * 1024),
+                                            root.srv_eula,
+                                            root.srv_prop_port,
+                                            root.srv_prop_max,
+                                            root.srv_prop_motd,
+                                            root.srv_prop_difficulty,
+                                            root.srv_prop_whitelist,
+                                            root.srv_prop_online
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Löschen mit Bestätigung (gleiches Muster wie bei Instanzen)
+                            MiscCard {
+                                title: "Server löschen";
+                                hint: "Löscht den Server-Ordner samt Welt endgültig. Ein laufender Server kann nicht gelöscht werden.";
+                                if !root.srv_confirm_delete : Button { text: "Server löschen..."; width: 170px; clicked => { root.srv_confirm_delete = true; } }
+                                if root.srv_confirm_delete : HorizontalLayout {
+                                    height: 30px;
+                                    spacing: 8px;
+                                    Text { text: "Wirklich löschen? Das geht nicht rückgängig."; color: #e08a8a; vertical-alignment: center; horizontal-stretch: 1; }
+                                    Rectangle {
+                                        width: 110px;
+                                        height: 26px;
+                                        border-radius: 4px;
+                                        background: srv_del_area.has-hover ? #e04040 : #c93030;
+                                        srv_del_area := TouchArea { clicked => { root.srv_delete(root.srv_selected); } }
+                                        Text { text: "Ja, löschen"; color: white; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                    }
+                                    Button { text: "Abbrechen"; width: 90px; clicked => { root.srv_confirm_delete = false; } }
+                                }
+                            }
                         }
                     }
                 }
@@ -858,7 +1931,9 @@ export component AppWindow inherits Window {
                                 clicked => { root.detail_open_folder(root.detail_instance_name) }
                             }
                             Button { text: "Misc"; width: 80px; clicked => { root.misc_open(root.detail_instance_name) } }
-                            Button { text: "Manage Instanz"; width: 130px; clicked => { root.manage_open(root.detail_instance_name) } }
+                            Button { text: "Absturz-Analyse"; width: 150px; clicked => { root.crash_analyze(root.detail_instance_name) } }
+                            //Button { text: "Manage Instanz"; width: 130px; clicked => { root.manage_open(root.detail_instance_name) } }
+                                                        Button { text: "Manage Instanz"; width: 130px; clicked => { root.manage_open(root.detail_instance_name); root.manage_update_load(root.detail_instance_name); } }
                         }
 
                         mods_scroll := ScrollView {
@@ -872,7 +1947,7 @@ export component AppWindow inherits Window {
                                     Image { source: mod_file.icon; width: 20px; height: 20px; }
                                     Text {
                                         text: mod_file.display_name;
-                                        color: mod_file.duplicate ? #ff9a2e : (mod_file.enabled ? white : #7a8291); // orange = doppelt
+                                        color: mod_file.duplicate ? #ff9a2e : (mod_file.orphan ? #c792ea : (mod_file.enabled ? white : #7a8291)); // orange = doppelt, lila = verwaiste Library
                                         vertical-alignment: center;
                                         horizontal-stretch: 1;
                                         overflow: elide;
@@ -922,27 +1997,163 @@ export component AppWindow inherits Window {
                             }
                         }
                         
+                                                // Feature 14: Welten (links) + Server (rechts)
                         Rectangle {
                             background: #232c3a;
                             border-radius: 6px;
-                            height: root.detail_quick_supported ? 46px : 66px;
+                            height: 260px;
 
                             VerticalLayout {
-                                padding: 8px;
-                                spacing: 4px;
+                                padding: 10px;
+                                spacing: 6px;
+
                                 HorizontalLayout {
-                                    spacing: 8px;
-                                    CheckBox { text: "Direkt verbinden"; enabled: root.detail_quick_supported; checked <=> root.detail_quick_enabled; }
-                                    LineEdit { placeholder-text: "Server (z.B. mc.example.net)"; enabled: root.detail_quick_supported; text <=> root.detail_quick_server; }
-                                    LineEdit { placeholder-text: "oder Weltname"; enabled: root.detail_quick_supported; text <=> root.detail_quick_world; }
-                                    Button {
-                                        text: "Speichern";
-                                        width: 90px;
-                                        enabled: root.detail_quick_supported;
-                                        clicked => { root.detail_save_quick(root.detail_instance_name, root.detail_quick_enabled, root.detail_quick_server, root.detail_quick_world) }
+                                    spacing: 12px;
+
+                                    // Linke Spalte: Welten
+                                    VerticalLayout {
+                                        spacing: 4px;
+                                        horizontal-stretch: 1;
+
+                                        HorizontalLayout {
+                                            height: 20px;
+                                            Text { text: "Welten"; color: white; font-weight: 700; font-size: 14px; vertical-alignment: center; horizontal-stretch: 1; }
+                                            Text { text: root.detail_worlds_status; color: #a0a8b5; font-size: 11px; vertical-alignment: center; }
+                                        }
+
+                                        if root.detail_worlds.length == 0 : Text {
+                                            text: "Keine Welten in dieser Instanz.";
+                                            color: #7a8291;
+                                            font-size: 11px;
+                                        }
+
+                                        ScrollView {
+                                            vertical-stretch: 1;
+                                            VerticalLayout {
+                                                spacing: 3px;
+                                                for w in root.detail_worlds : Rectangle {
+                                                    height: 30px;
+                                                    background: world_area.has-hover ? #2f3a4c : #1e2632;
+                                                    border-radius: 4px;
+
+                                                    world_area := TouchArea { }
+
+                                                    HorizontalLayout {
+                                                        padding: 4px;
+                                                        spacing: 6px;
+                                                        Image { source: w.icon; width: 22px; height: 22px; }
+                                                        VerticalLayout {
+                                                            spacing: 0px;
+                                                            Text {
+                                                                text: w.display_name + (w.hardcore ? "  ☠" : "");
+                                                                color: w.hardcore ? #ff5c5c : white;
+                                                                font-size: 12px;
+                                                                vertical-alignment: center;
+                                                                horizontal-stretch: 1;
+                                                                overflow: elide;
+                                                            }
+                                                            Text {
+                                                                text: w.game_type_text + " · " + w.version + " · " + w.last_played_text;
+                                                                color: #7a8291;
+                                                                font-size: 9px;
+                                                                vertical-alignment: center;
+                                                            }
+                                                        }
+                                                        Button {
+                                                            text: "Play";
+                                                            width: 60px;
+                                                            height: 22px;
+                                                            primary: true;
+                                                            clicked => { root.world_play(root.detail_instance_name, w.folder_name) }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Rechte Spalte: Server
+                                    VerticalLayout {
+                                        spacing: 4px;
+                                        horizontal-stretch: 1;
+
+                                        HorizontalLayout {
+                                            height: 20px;
+                                            Text { text: "Server"; color: white; font-weight: 700; font-size: 14px; vertical-alignment: center; horizontal-stretch: 1; }
+                                            Text { text: root.detail_servers_status; color: #a0a8b5; font-size: 11px; vertical-alignment: center; }
+                                            Button {
+                                                text: "Aktualisieren";
+                                                width: 110px;
+                                                height: 20px;
+                                                clicked => { root.refresh_servers(root.detail_instance_name) }
+                                            }
+                                        }
+
+                                        if root.detail_servers.length == 0 : Text {
+                                            text: "Keine Server in servers.dat.";
+                                            color: #7a8291;
+                                            font-size: 11px;
+                                        }
+
+                                        ScrollView {
+                                            vertical-stretch: 1;
+                                            VerticalLayout {
+                                                spacing: 3px;
+                                                for s in root.detail_servers : Rectangle {
+                                                    height: 30px;
+                                                    background: server_area.has-hover ? #2f3a4c : #1e2632;
+                                                    border-radius: 4px;
+
+                                                    server_area := TouchArea { }
+
+                                                    HorizontalLayout {
+                                                        padding: 4px;
+                                                        spacing: 6px;
+
+                                                        // Status-Punkt
+                                                        Rectangle {
+                                                            width: 10px;
+                                                            height: 10px;
+                                                            border-radius: 5px;
+                                                            y: parent.height/2 - 5px;
+                                                            background: s.status == "online" ? #1bd96a
+                                                                      : s.status == "offline" ? #e04040
+                                                                      : s.status == "checking" ? #ffd43b
+                                                                      : #7a8291;
+                                                        }
+
+                                                        Image { source: s.icon; width: 22px; height: 22px; }
+
+                                                        VerticalLayout {
+                                                            spacing: 0px;
+                                                            Text {
+                                                                text: s.name;
+                                                                color: white;
+                                                                font-size: 12px;
+                                                                vertical-alignment: center;
+                                                                horizontal-stretch: 1;
+                                                                overflow: elide;
+                                                            }
+                                                            Text {
+                                                                text: s.ip + (s.players_text != "" ? " · " + s.players_text : "");
+                                                                color: #7a8291;
+                                                                font-size: 9px;
+                                                                vertical-alignment: center;
+                                                            }
+                                                        }
+                                                        Button {
+                                                            text: "Join";
+                                                            width: 55px;
+                                                            height: 22px;
+                                                            primary: true;
+                                                            clicked => { root.server_join(root.detail_instance_name, s.ip) }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
-                                if !root.detail_quick_supported : Text { text: "Quick Play gibt es erst ab Minecraft 1.20."; color: #ff9a2e; font-size: 11px; }
                             }
                         }
 
@@ -995,11 +2206,11 @@ export component AppWindow inherits Window {
                                         }
                                     }
 
-                                    // 2. Java Pfad Dropdown
-                                    Text { text: "Java Ausführungspfad"; font-size: 14px; font-weight: 700; color: #a0a8b5; }
+                                    // 2. Java-Version Dropdown
+                                    Text { text: "Java-Version"; font-size: 14px; font-weight: 700; color: #a0a8b5; }
                                     ComboBox {
                                         model: root.available_java_paths;
-                                        current-value <=> root.detail_java_selection; // Automatische Zwei-Wege-Bindung
+                                        current-value <=> root.detail_java_selection;
                                     }
 
                                     // 3. Account Auswahl Dropdown
@@ -1067,6 +2278,7 @@ export component AppWindow inherits Window {
         instances: root.running_instances;
         expanded <=> root.running_bar_expanded;
         force_stop(n) => { root.force_stop(n) }
+        open_console(n) => { root.console_open(n) }
     }
 
     if popup_new_instance : Rectangle {
@@ -1184,8 +2396,14 @@ export component AppWindow inherits Window {
 
                         MiscCard {
                             title: "Exportieren";
-                            hint: "Packt die Instanz (ohne logs und crash-reports) als .zip in deinen Downloads-Ordner.";
-                            Button { text: "Als .zip exportieren"; width: 190px; clicked => { root.manage_export(root.detail_instance_name) } }
+                            hint: "Als .zip: die komplette Instanz (ohne logs und crash-reports). Als .mrpack: zum Teilen mit Freunden, Mods als Modrinth-Links, ohne Welten.";
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                alignment: start;
+                                Button { text: "Als .zip exportieren"; width: 190px; clicked => { root.manage_export(root.detail_instance_name) } }
+                                Button { text: "Als .mrpack exportieren"; width: 200px; clicked => { root.manage_export_mrpack(root.detail_instance_name) } }
+                            }
                         }
 
                         MiscCard {
@@ -1208,6 +2426,54 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
+
+                        MiscCard {
+                            title: "Update Instanz using .mrpack";
+                            hint: "Spielt eine lokal gespeicherte .mrpack-Datei als Update ein. Gleiche Logik wie das Modpack-Update: Welten und deine Config-Änderungen bleiben erhalten. Nach dem Prüfen erscheint unten bei 'Modpack-Update' der Bericht mit dem Button 'Update durchführen'.";
+                            hint_height: 66px;
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                update_file_box := LineEdit {
+                                    placeholder-text: "/pfad/zur/neuen-version.mrpack";
+                                    horizontal-stretch: 1;
+                                }
+                                Button {
+                                    text: "Update Instanz using .mrpack";
+                                    width: 230px;
+                                    clicked => { root.manage_update_from_file(root.detail_instance_name, update_file_box.text) }
+                                }
+                            }
+                        }
+
+                        MiscCard {
+                            title: "Modpack-Update";
+                            hint: root.manage_update_supported
+                                ? "Neue Pack-Version einspielen. Welten und deine Config-Änderungen bleiben erhalten, nur bei echten Konflikten wirst du gefragt."
+                                : "Nur für Modrinth-Modpacks, die über den Launcher installiert wurden (ältere Instanzen haben keine Herkunftsangabe).";
+                            if root.manage_update_supported : HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                update_combo := ComboBox { model: root.manage_update_versions; horizontal-stretch: 1; }
+                                Button { text: "Prüfen"; width: 90px; clicked => { root.manage_update_check(root.detail_instance_name, update_combo.current-index) } }
+                            }
+                            if root.manage_update_report != "" : Text { text: root.manage_update_report; color: #dddddd; font-size: 12px; wrap: word-wrap; }
+                            if root.manage_update_pending : HorizontalLayout {
+                                height: 30px;
+                                Button { text: "Update durchführen"; primary: true; clicked => { root.manage_update_apply(root.detail_instance_name) } }
+                            }
+                        }
+
+                        MiscCard {
+                            title: "Desktop-Verknüpfung";
+                            hint: "Erstellt eine Verknüpfung, die diese Instanz direkt startet — ohne den Launcher manuell zu öffnen.";
+                            Button {
+                                text: "Verknüpfung erstellen";
+                                width: 200px;
+                                clicked => { root.create_shortcut(root.detail_instance_name) }
+                            }
+                        }
+
 
                         MiscCard {
                             title: "Löschen";
@@ -1382,8 +2648,10 @@ export component AppWindow inherits Window {
                             summary: pack.summary;
                             author: pack.author;
                             icon: pack.icon;
-                            source: pack.source; // <-- NEU: Source auch hier übergeben
-                            install_clicked(id, n, src) => { root.detail_add_mod_install(root.detail_instance_name, id, n) } // src wird von Rust vorerst ignoriert
+                            source: pack.source;
+                            starred: pack.starred;
+                            install_clicked(id, n, src) => { root.detail_add_mod_install(root.detail_instance_name, id, n) }
+                            toggle_star(id) => { root.toggle_favorite("mods", id) }
                         }
                     }
                 }
@@ -1408,30 +2676,112 @@ export component AppWindow inherits Window {
         }
     }
 
-    // Misc-Popup: bewusst leer, nur Rahmen + horizontal scrollbare Reihe.
-    // Neue Features kommen später als einzelne "Karten" in das HorizontalLayout unten.
-    if misc_popup_visible : Rectangle {
+        // Preset-Mod-Popup: Mod-Browser für den Presets-Tab. Nutzt dieselben Kacheln
+    // wie das Add-Mod-Popup, aber "Hinzufügen" trägt den Mod nur in die Preset-Liste ein
+    // (preset_new_add_mod), es wird nichts heruntergeladen.
+    if preset_add_mod_popup_visible : Rectangle {
         width: 100%;
         height: 100%;
-        background: #00000099; // abgedunkelter Hintergrund wie bei den anderen Popups
+        background: #00000099;
 
-        TouchArea { clicked => { root.misc_popup_visible = false } } // Klick daneben schließt
+        TouchArea { clicked => { root.preset_add_mod_popup_visible = false } }
 
         Rectangle {
-            width: 80%;
-            height: 50%;
+            width: 60%;
+            height: 60%;
             x: parent.width/2 - self.width/2;
             y: parent.height/2 - self.height/2;
             background: #2c3747;
             border-radius: 6px;
 
-            TouchArea {} // fängt Klicks ab, damit sie nicht "durchfallen" und das Popup schließen
+            TouchArea {} // fängt Klicks ab, damit das Popup nicht schließt
+
+            VerticalLayout {
+                spacing: 16px;
+                padding: 16px;
+
+                HorizontalLayout {
+                    max-height: 40px;
+                    spacing: 10px;
+
+                    // Zeigt, nach was gerade gefiltert wird (kommt aus dem Preset-Editor)
+                    Text {
+                        text: "Filter: "
+                            + (root.preset_new_mc == "" ? "alle Versionen" : root.preset_new_mc)
+                            + "  ·  "
+                            + ((root.preset_new_loader == "vanilla" || root.preset_new_loader == "") ? "kein Loader-Filter" : root.preset_new_loader);
+                        color: #7bdc8a;
+                        font-size: 12px;
+                        height: 16px;
+                    }
+
+                    preset_mod_search_box := LineEdit {
+                        placeholder-text: "Mods durchsuchen...";
+                        accepted(text) => { root.preset_new_add_mod_search(text) }
+                    }
+                    Button {
+                        text: "Suchen";
+                        width: 80px;
+                        clicked => { root.preset_new_add_mod_search(preset_mod_search_box.text) }
+                    }
+                    Button {
+                        text: "Schließen";
+                        width: 90px;
+                        clicked => { root.preset_add_mod_popup_visible = false }
+                    }
+                }
+
+                preset_mod_scroll := ScrollView {
+                    vertical-stretch: 1;
+                    property <int> cols: max(1, floor((self.width / 1px) / 240));
+
+                    GridLayout {
+                        spacing: 16px;
+
+                        for pack[i] in root.preset_add_mod_results : BrowserTile {
+                            row: floor(i / preset_mod_scroll.cols);
+                            col: mod(i, preset_mod_scroll.cols);
+                            project_id: pack.project_id;
+                            name: pack.name;
+                            summary: pack.summary;
+                            author: pack.author;
+                            icon: pack.icon;
+                            source: pack.source;
+                            starred: pack.starred;
+                            action_text: "Hinzufügen";
+                            // id = project_id, n = Name -> landet in der Preset-Mod-Liste
+                            install_clicked(id, n, src) => { root.preset_new_add_mod(id, n) }
+                            toggle_star(id) => { root.toggle_favorite("mods", id) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Misc-Popup: Karten in einer scrollbaren Spalte.
+    // Größe: 90% x 88% (vorher 80% x 50%), feste Höhen für alle umbrochenen Texte.
+    if misc_popup_visible : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #00000099;
+
+        TouchArea { clicked => { root.misc_popup_visible = false } }
+
+        Rectangle {
+            width: 90%;
+            height: 88%;
+            x: parent.width/2 - self.width/2;
+            y: parent.height/2 - self.height/2;
+            background: #2c3747;
+            border-radius: 6px;
+
+            TouchArea {}
 
             VerticalLayout {
                 spacing: 12px;
                 padding: 16px;
 
-                // Titelzeile: Instanzname + Schließen-Button rechts
                 HorizontalLayout {
                     max-height: 30px;
                     spacing: 10px;
@@ -1452,7 +2802,6 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // Der Bereich für die Karten: füllt den Rest des Popups, scrollt bei vielen Karten seitlich
                 misc_scroll := ScrollView {
                     vertical-stretch: 1;
 
@@ -1468,17 +2817,24 @@ export component AppWindow inherits Window {
                             LineEdit { text <=> root.misc_jvm_args; placeholder-text: "-Xss2M ..."; }
                         }
 
-                        // 2. JVM-Presets mit Erklärung und Vorschlag
+                        // 2. JVM-Presets: der Vorschlagstext kann lang werden -> 72px
                         MiscCard {
                             title: "JVM-Preset";
                             hint: root.misc_suggestion;
+                            hint_height: 72px;
+
                             for p in root.misc_presets : Rectangle {
+                                height: 150px; // FEST: verhindert das Überlappen mit der nächsten Karte
                                 background: root.misc_preset_id == p.id ? #2c4a66 : #1b2330;
                                 border-radius: 4px;
+                                clip: true;
+
                                 VerticalLayout {
                                     padding: 8px;
                                     spacing: 4px;
+
                                     HorizontalLayout {
+                                        height: 26px;
                                         spacing: 8px;
                                         Text {
                                             text: p.title + (p.suggested ? "  (Vorschlag)" : "");
@@ -1486,6 +2842,7 @@ export component AppWindow inherits Window {
                                             font-weight: 700;
                                             vertical-alignment: center;
                                             horizontal-stretch: 1;
+                                            overflow: elide;
                                         }
                                         Button {
                                             text: root.misc_preset_id == p.id ? "Gewählt" : "Wählen";
@@ -1495,8 +2852,24 @@ export component AppWindow inherits Window {
                                             clicked => { root.misc_preset_id = p.id }
                                         }
                                     }
-                                    Text { text: p.description; wrap: word-wrap; color: #a0a8b5; font-size: 12px; }
-                                    if p.flags != "" : Text { text: p.flags; wrap: word-wrap; color: #7a8291; font-size: 10px; }
+                                    // Beschreibung: bis zu 4 Zeilen, Rest wird mit "..." abgeschnitten
+                                    Text {
+                                        text: p.description;
+                                        wrap: word-wrap;
+                                        color: #a0a8b5;
+                                        font-size: 12px;
+                                        height: 68px;
+                                        vertical-alignment: top;
+                                        overflow: elide;
+                                    }
+                                    // Flags: nur eine Zeile (gekürzt)
+                                    Text {
+                                        text: p.flags;
+                                        color: #7a8291;
+                                        font-size: 10px;
+                                        height: 14px;
+                                        overflow: elide;
+                                    }
                                 }
                             }
                         }
@@ -1528,11 +2901,11 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // 4. Wrapper-Programme (je nach Betriebssystem)
+                        // 4. Wrapper-Programme
                         MiscCard {
                             title: "Wrapper-Programme";
                             hint: "Nur Programme, die auf diesem System gefunden wurden, sind wählbar.";
-                            if root.misc_wrappers.length == 0 : Text { text: "Für dieses System gibt es keine passenden Wrapper."; color: #7a8291; font-size: 12px; }
+                            if root.misc_wrappers.length == 0 : Text { text: "Für dieses System gibt es keine passenden Wrapper."; color: #7a8291; font-size: 12px; height: 18px; }
                             for w in root.misc_wrappers : VerticalLayout {
                                 spacing: 2px;
                                 CheckBox {
@@ -1541,28 +2914,44 @@ export component AppWindow inherits Window {
                                     enabled: w.available;
                                     toggled => { root.misc_wrapper_toggle(root.detail_instance_name, w.id, self.checked) }
                                 }
-                                Text { text: w.hint; color: #7a8291; font-size: 11px; wrap: word-wrap; }
+                                Text { text: w.hint; color: #7a8291; font-size: 11px; wrap: word-wrap; height: 32px; vertical-alignment: top; overflow: elide; }
                             }
-                            if root.misc_wrapper_warning != "" : Text { text: root.misc_wrapper_warning; color: #ff9a2e; font-size: 12px; wrap: word-wrap; }
+                            if root.misc_wrapper_warning != "" : Text { text: root.misc_wrapper_warning; color: #ff9a2e; font-size: 12px; wrap: word-wrap; height: 36px; vertical-alignment: top; overflow: elide; }
                         }
 
                         // 5. System-GLFW (nur Linux)
                         if root.misc_is_linux : MiscCard {
                             title: "System-GLFW verwenden";
+                            hint_height: 52px;
                             hint: root.misc_glfw_found
                                 ? "Nutzt die auf deinem System installierte GLFW statt der mitgelieferten. Hilft, wenn das Fenster beim Start abstürzt (Standard: an)."
                                 : "Keine System-GLFW gefunden (z.B. sudo pacman -S glfw oder sudo apt install libglfw3). Der Schalter hat dann keine Wirkung.";
                             CheckBox { text: "System-GLFW verwenden"; checked <=> root.misc_use_system_glfw; enabled: root.misc_glfw_found; }
                         }
 
-                        // 6. Doppelte Mods: Erlaubnis zum automatischen Beheben (Logik in Block 4)
+                        // 6. Doppelte Mods
                         MiscCard {
                             title: "Doppelte Mods";
+                            hint_height: 52px;
                             hint: "Doppelte Mods erscheinen in der Mod-Liste orange. Das automatische Beheben ist standardmäßig verboten; auch wenn du es erlaubst, wird nichts ohne deine Bestätigung geändert.";
                             CheckBox { text: "Automatisches Beheben erlauben"; checked <=> root.misc_auto_fix_dupes; }
                         }
 
-                        // Speichern (Textfelder, Preset, Schalter). Env und Wrapper werden sofort gespeichert.
+                        // 7. Werkzeuge
+                        MiscCard {
+                            title: "Werkzeuge";
+                            hint_height: 72px;
+                            hint: "Server-Pack: Zip ohne Client-only-Mods in den Downloads-Ordner. Verwaiste Libraries: Mods, die von keinem anderen Mod gebraucht werden, erscheinen lila in der Mod-Liste (nur ein Hinweis, vor dem Löschen prüfen).";
+                            HorizontalLayout {
+                                height: 30px;
+                                spacing: 8px;
+                                alignment: start;
+                                Button { text: "Server-Pack erstellen"; width: 190px; clicked => { root.sp_name = root.detail_instance_name + " Server"; root.sp_popup_visible = true; } }
+                                Button { text: "Verwaiste Libraries suchen"; width: 220px; clicked => { root.orphans_scan(root.detail_instance_name) } }
+                            }
+                            if root.misc_tools_status != "" : Text { text: root.misc_tools_status; color: #a0d8a0; wrap: word-wrap; font-size: 12px; height: 52px; vertical-alignment: top; overflow: elide; }
+                        }
+
                         HorizontalLayout {
                             height: 30px;
                             spacing: 10px;
@@ -1580,7 +2969,7 @@ export component AppWindow inherits Window {
                 }
             }
         }
-    }   
+    } 
 
     if compat_popup_visible : Rectangle {
         width: 100%; height: 100%;
@@ -1599,19 +2988,22 @@ export component AppWindow inherits Window {
                 padding: 16px;
 
                 if !root.compat_conflict_visible : Text {
-                    text: "Vorgeschlagene Änderungen";
-                    color: white; font-weight: 700; horizontal-alignment: center;
+                    text: root.compat_mode == "update" ? "Konflikte: diese Dateien wurden von dir UND vom Modpack geändert" : "Vorgeschlagene Änderungen";
+                    color: white; font-weight: 700; horizontal-alignment: center; wrap: word-wrap;
                 }
                 if !root.compat_conflict_visible : ScrollView {
                     vertical-stretch: 1;
                     VerticalLayout {
                         spacing: 4px;
+
                         for action in root.compat_actions : HorizontalLayout {
                             max-height: 26px; spacing: 10px;
                             Text { text: action.label; color: action.confirmed ? white : #7a8291; vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap; }
                             Button {
-                                text: action.confirmed ? "Bestätigt" : "Übersprungen";
-                                width: 100px; height: 22px;
+                                text: root.compat_mode == "update"
+                                    ? (action.confirmed ? "Neue Datei" : "Meine Datei")
+                                    : (action.confirmed ? "Bestätigt" : "Übersprungen");
+                                width: 110px; height: 22px;
                                 clicked => { root.compat_toggle_action(action.project_id) }
                             }
                         }
@@ -1625,6 +3017,7 @@ export component AppWindow inherits Window {
                         primary: true;
                         clicked => {
                             if root.compat_mode == "duplicates" { root.duplicates_apply(root.detail_instance_name) }
+                            else if root.compat_mode == "update" { root.update_confirm(root.detail_instance_name) }
                             else { root.compat_apply(root.detail_instance_name) }
                         }
                     }
@@ -1854,5 +3247,284 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    // Live-Konsole: zeigt den Tail des laufenden Logs einer Instanz.
+    // Ringpuffer (500 Zeilen) hält den RAM konstant; Auto-Scroll schaltet sich
+    // automatisch aus, sobald der Nutzer hochscrollt, und wieder an, wenn er
+    // ans Ende zurückkehrt.
+    if console_popup_visible : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #00000099;
+
+        TouchArea { clicked => { root.console_close(); } }
+
+        Rectangle {
+            width: 80%;
+            height: 70%;
+            x: parent.width/2 - self.width/2;
+            y: parent.height/2 - self.height/2;
+            background: #1a1e26;
+            border-radius: 6px;
+
+            TouchArea {}
+
+            VerticalLayout {
+                spacing: 8px;
+                padding: 12px;
+
+                HorizontalLayout {
+                    max-height: 32px;
+                    spacing: 8px;
+
+                    Text {
+                        text: "Live Console: " + root.console_instance_name;
+                        color: #7bdc8a;
+                        font-weight: 700;
+                        font-size: 14px;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: root.console_auto_scroll ? "Auto-Scroll: AN" : "Auto-Scroll: AUS";
+                        color: root.console_auto_scroll ? #7bdc8a : #ff9a2e;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                    Button {
+                        text: root.console_auto_scroll ? "Auto-Scroll aus" : "Auto-Scroll an";
+                        width: 140px;
+                        clicked => { root.console_auto_scroll = !root.console_auto_scroll; }
+                    }
+                    Button {
+                        text: "Schließen";
+                        width: 90px;
+                        clicked => { root.console_close(); }
+                    }
+                }
+
+                console_scroll := ScrollView {
+                    vertical-stretch: 1;
+
+                    // Lokale Bindings: erfassen Änderungen der externen Properties.
+                    // `changed` funktioniert in Slint nur auf eigenen Properties der
+                    // Komponente, deshalb dieser Umweg.
+                    property <int> observe_tick: root.console_scroll_tick;
+                    property <length> observe_viewport: self.content-y;
+
+                    // Bei jedem neuen Log-Batch ans Ende springen.
+                    changed observe_tick => {
+                        if (root.console_auto_scroll) {
+                            self.content-y = 1000000px;
+                        }
+                    }
+
+                    // Nutzer scrollt: unten -> Auto an, sonst aus.
+                    changed observe_viewport => {
+                        let at_bottom = self.content-y >= self.content-height - self.height - 10px;
+                        if (!at_bottom) {
+                            root.console_auto_scroll = false;
+                        } else {
+                            root.console_auto_scroll = true;
+                        }
+                    }
+
+                    VerticalLayout {
+                        padding: 6px;
+                        spacing: 1px;
+
+                        if root.console_lines.length == 0 : Text {
+                            text: "(Noch keine Log-Ausgabe. Die Konsole liest ab jetzt neue Zeilen mit.)";
+                            color: #7a8291;
+                            font-size: 11px;
+                        }
+
+                        for line in root.console_lines : Text {
+                            text: line;
+                            color: #dddddd;
+                            font-size: 11px;
+                            wrap: no-wrap;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Recache-Popup: Fortschrittsanzeige beim Neu-Erstellen des Icon-Caches.
+    if recache_popup_visible : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #00000099;
+
+        TouchArea { } // kein Schließen durch Klick daneben — läuft bis fertig
+
+        Rectangle {
+            width: 500px;
+            height: 160px;
+            x: parent.width/2 - self.width/2;
+            y: parent.height/2 - self.height/2;
+            background: #2c3747;
+            border-radius: 6px;
+
+            TouchArea {}
+
+            VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+
+                Text {
+                    text: "Icon-Cache wird neu erstellt";
+                    color: white;
+                    font-weight: 700;
+                    font-size: 16px;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: root.recache_status;
+                    color: #a0d8a0;
+                    wrap: word-wrap;
+                    horizontal-alignment: center;
+                    font-size: 12px;
+                    height: 40px;
+                }
+                Rectangle {
+                    height: 20px;
+                    background: #1b2330;
+                    border-radius: 4px;
+                    Rectangle {
+                        width: parent.width * root.recache_progress;
+                        height: 100%;
+                        background: #1bd96a;
+                        border-radius: 4px;
+                        animate width { duration: 200ms; easing: ease-in-out; }
+                    }
+                }
+            }
+        }
+    }
+
+        // Server-Pack-Popup: fragt vor dem Export, ob der Server auch in die Server-Liste soll
+    if sp_popup_visible : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #00000099;
+        TouchArea { clicked => { root.sp_popup_visible = false; } }
+
+        Rectangle {
+            width: 520px;
+            height: 270px;
+            x: parent.width / 2 - self.width / 2;
+            y: parent.height / 2 - self.height / 2;
+            background: #2c3747;
+            border-radius: 6px;
+            TouchArea {}
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+                Text { text: "Server-Pack erstellen"; color: white; font-weight: 700; font-size: 16px; horizontal-alignment: center; }
+                Text {
+                    text: "Das Pack (ohne Client-only-Mods) wird als .zip in den Downloads-Ordner gelegt.";
+                    color: #a0a8b5;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                    height: 34px;
+                }
+                CheckBox { text: "Zusätzlich als Server zur Server-Liste hinzufügen"; checked <=> root.sp_add; }
+                if root.sp_add : LineEdit { placeholder-text: "Name des Servers"; text <=> root.sp_name; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 10px;
+                    Button { text: "Abbrechen"; clicked => { root.sp_popup_visible = false; } }
+                    Button {
+                        text: "Erstellen";
+                        primary: true;
+                        clicked => {
+                            root.sp_popup_visible = false;
+                            root.server_pack_export(root.detail_instance_name, root.sp_add, root.sp_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Absturz-Analyse-Popup. Die Karten haben FESTE Höhen (Slint rechnet umbrochenen Text
+    // in Layouts nicht breitenabhängig), sehr lange Texte werden mit "..." gekürzt.
+    if crash_popup_visible : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #00000099;
+        TouchArea { clicked => { root.crash_popup_visible = false; } }
+
+        Rectangle {
+            width: 70%;
+            height: 80%;
+            x: parent.width / 2 - self.width / 2;
+            y: parent.height / 2 - self.height / 2;
+            background: #2c3747;
+            border-radius: 6px;
+            TouchArea {}
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    max-height: 30px;
+                    spacing: 10px;
+                    Text { text: "Absturz-Analyse: " + root.crash_instance; color: white; font-size: 16px; font-weight: 700; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                    Button { text: "Schließen"; width: 90px; clicked => { root.crash_popup_visible = false; } }
+                }
+
+                Text { text: root.crash_summary; color: #ff9a2e; font-size: 12px; wrap: word-wrap; height: 34px; vertical-alignment: top; overflow: elide; }
+
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        spacing: 10px;
+                        alignment: start;
+
+                        for f in root.crash_findings : Rectangle {
+                            height: 230px;
+                            background: #232c3a;
+                            border-radius: 6px;
+
+                            VerticalLayout {
+                                padding: 10px;
+                                spacing: 6px;
+                                Text { text: f.title; color: #ff9a2e; font-weight: 700; font-size: 14px; height: 20px; overflow: elide; }
+                                Text { text: f.explanation; color: white; font-size: 12px; wrap: word-wrap; height: 70px; vertical-alignment: top; overflow: elide; }
+                                Text { text: "Lösung: " + f.suggestion; color: #7bdc8a; font-size: 12px; wrap: word-wrap; height: 70px; vertical-alignment: top; overflow: elide; }
+                                if f.mod_file != "" : HorizontalLayout {
+                                    height: 28px;
+                                    spacing: 8px;
+                                    Text { text: "Verdächtig: " + f.mod_file; color: #c792ea; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                                    Button { text: "Deaktivieren"; width: 110px; clicked => { root.crash_disable_mod(root.crash_instance, f.mod_file); } }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    height: 30px;
+                    spacing: 10px;
+                    Text { text: root.crash_status; color: #a0d8a0; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                    Button { text: "Report / Log öffnen"; width: 170px; clicked => { root.crash_open_report(root.crash_instance); } }
+                }
+            }
+        }
+    }
+
+    if root.launch_popup_visible : LaunchOverlay {
+        width: 100%;
+        height: 100%;
+        instance: root.launch_instance;
+        status: root.launch_status;
+        progress: root.launch_progress;
     }
 }

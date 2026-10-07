@@ -14,9 +14,20 @@ slint = "1.16.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "io-util", "time"] }
 reqwest = { version = "0.12", features = ["json"] }
 zip = "2"
-image = { version = "0.25", default-features = false, features = ["webp", "png"] }
+image = { version = "0.25", default-features = false, features = ["webp", "png", "jpeg"] }
 futures = "0.3"
 hotpath = "0.28.2"
+flate2 = "1"
+tar = "0.4"
+sysinfo = "0.32"
+fastnbt = "2.5"
+base64 = "0.22"
+hickory-resolver = "0.24"
+sha1 = "0.10"          # SHA-1 der Mod-Jars (Modrinth erkennt Dateien per Hash)
+notify-rust = "4"      # Desktop-Benachrichtigungen
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = "0.2"           # Tray-Icon (StatusNotifierItem), nur Linux
 
 [build-dependencies]
 slint-build = "1.16.1"
@@ -31,7 +42,7 @@ hotpath-alloc = ["hotpath/hotpath-alloc"] # Optional, um auch Speicherallokation
 
 [profile.release]
 opt-level = 3
-lto = "thin"          # oder "fat" für max Performance
+lto = "fat"          # oder "fat" für max Performance
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
